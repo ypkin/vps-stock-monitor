@@ -5,6 +5,13 @@ vps-stock-monitor是一个简单的库存监控工具，支持通过配置监控
 ```
 nano /etc/systemd/system/stock-monitor.service
 ```
+systemd 重新加载配置并重启服务
+
+```
+systemctl daemon-reload && systemctl restart stock-monitor
+```
+============================================================
+
 安装命令：
 ```
 wget -O sm.sh https://raw.githubusercontent.com/ypkin/vps-stock-monitor/refs/heads/main/sm.sh && chmod +x sm.sh && ./sm.sh
