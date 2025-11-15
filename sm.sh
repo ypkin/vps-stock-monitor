@@ -3,7 +3,7 @@
 # =================================================================
 # Stock Monitor (Pushplus 版) 多功能管理脚本
 # 快捷命令: sm
-# (v5 - 优化 FlareSolverr 超时和错误处理)
+# (v5.2 - 增加卸载保留配置 / 安装检测旧配置)
 # =================================================================
 
 # 定义颜色
@@ -17,7 +17,8 @@ INSTALL_DIR="/opt/stock-monitor"
 SERVICE_NAME="stock-monitor"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 VENV_DIR="${INSTALL_DIR}/venv"
-CONFIG_FILE="${INSTALL_DIR}/data/config.json"
+DATA_DIR="${INSTALL_DIR}/data"
+CONFIG_FILE="${DATA_DIR}/config.json"
 SM_COMMAND_PATH="/usr/local/bin/sm"
 
 # 检查是否为 root 用户
@@ -45,7 +46,7 @@ is_installed() {
 # 1. 安装服务
 install_monitor() {
     check_root
-    echo -e "${GREEN}1. 开始安装 Stock Monitor (v5 - FlareSolverr 优化)...${NC}"
+    echo -e "${GREEN}1. 开始安装 Stock Monitor (v5.2 - 增加配置检测)...${NC}"
 
     if is_installed; then
         echo -e "${YELLOW}警告：检测到已安装的服务。将首先执行卸载...${NC}"
@@ -60,9 +61,20 @@ install_monitor() {
         exit 1
     fi
 
-    # 询问端口 (保留)
+    # 询问端口
     read -p "请输入您希望 Web 服务运行的端口 (1-65535，默认 5000): " MONITOR_PORT
     MONITOR_PORT=${MONITOR_PORT:-5000}
+
+    # *** v5.1 凭据设置 ***
+    echo -e "${GREEN}-------------------------------------------${NC}"
+    echo -e "${YELLOW}为您的 Web UI 设置登录凭据。${NC}"
+    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USER
+    ADMIN_USER=${ADMIN_USER:-admin}
+    read -s -p "请输入管理员密码 (默认: password): " ADMIN_PASS
+    echo "" # 换行
+    ADMIN_PASS=${ADMIN_PASS:-password}
+    echo -e "${GREEN}凭据设置完成。${NC}"
+    echo -e "${GREEN}-------------------------------------------${NC}"
 
     # *** 自动 FlareSolverr 逻辑 (v4) ***
     echo -e "${GREEN}-------------------------------------------${NC}"
@@ -115,9 +127,20 @@ install_monitor() {
     echo -e "${GREEN}-------------------------------------------${NC}"
     # *** 自动化逻辑结束 ***
 
-    echo -e "${GREEN}创建目录: ${INSTALL_DIR}, ${INSTALL_DIR}/templates, ${INSTALL_DIR}/data${NC}"
+    echo -e "${GREEN}创建目录: ${INSTALL_DIR}, ${INSTALL_DIR}/templates, ${DATA_DIR}${NC}"
     mkdir -p "${INSTALL_DIR}/templates"
-    mkdir -p "${INSTALL_DIR}/data"
+    mkdir -p "${DATA_DIR}"
+
+    # *** v5.2 新增：检测旧配置 ***
+    echo -e "${GREEN}-------------------------------------------${NC}"
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}检测到先前保留的配置文件: ${CONFIG_FILE}${NC}"
+        echo -e "${GREEN}安装程序将跳过创建新配置，服务启动后将自动加载此文件。${NC}"
+    else
+        echo -e "${GREEN}未检测到旧配置，服务首次启动时将自动创建。${NC}"
+    fi
+    echo -e "${GREEN}-------------------------------------------${NC}"
+    # *** 检测结束 ***
 
     echo -e "${GREEN}创建 Python 虚拟环境...${NC}"
     python3 -m venv "$VENV_DIR"
@@ -133,7 +156,7 @@ install_monitor() {
     deactivate
 
     # -------------------------------------------------
-    # 写入 core.py (*** 这是 v5 的主要更新 ***)
+    # 写入 core.py (v5 优化版)
     # -------------------------------------------------
     echo -e "${GREEN}写入 core.py (v5 优化版)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/core.py"
@@ -423,29 +446,83 @@ if __name__ == "__main__":
 EOF
 
     # -------------------------------------------------
-    # 写入 web.py (不变)
+    # 写入 web.py (v5.1 登录验证)
     # -------------------------------------------------
-    echo -e "${GREEN}写入 web.py...${NC}"
+    echo -e "${GREEN}写入 web.py (v5.1 登录验证)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/web.py"
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from core import StockMonitor
 import json
 import threading
 import os
-
+from functools import wraps # 导入 wraps
 
 app = Flask(__name__)
+# *** 新增：为 session 设置一个 secret key ***
+# 警告：在生产环境中应使用更复杂的随机密钥
+app.secret_key = os.urandom(24) 
 monitor = StockMonitor()
+
+# *** 新增：从环境变量读取凭据 ***
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "password")
+
 
 # 避免冲突
 app.jinja_env.variable_start_string = '<<'
 app.jinja_env.variable_end_string = '>>'
 
+# *** 新增：登录装饰器 ***
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'logged_in' not in session:
+            # 如果是 API 请求，返回 401
+            if request.path.startswith('/api/'):
+                return jsonify({"status": "error", "message": "Unauthorized"}), 401
+            # 否则重定向到登录页
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# *** 新增：登录页面路由 ***
+@app.route('/login')
+def login():
+    # 如果已经登录，直接重定向到主页
+    if 'logged_in' in session:
+        return redirect(url_for('index'))
+    return render_template('login.html')
+
+# *** 新增：登录 API 路由 ***
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+
+    if username == ADMIN_USER and password == ADMIN_PASS:
+        session['logged_in'] = True
+        return jsonify({"status": "success", "message": "Login successful"})
+    else:
+        return jsonify({"status": "error", "message": "Invalid credentials"}), 403
+
+# *** 新增：登出 API 路由 ***
+@app.route('/api/logout', methods=['POST'])
+@login_required
+def api_logout():
+    session.pop('logged_in', None)
+    return jsonify({"status": "success", "message": "Logged out"})
+
+
+# *** 修改：保护主页 ***
 @app.route('/')
+@login_required
 def index():
     return render_template('index.html')
 
+# *** 修改：保护 config API ***
 @app.route('/api/config', methods=['GET', 'POST'])
+@login_required
 def config():
     if request.method == 'POST':
         data = request.json
@@ -457,7 +534,9 @@ def config():
     else:
         return jsonify(monitor.config.get('config', {}))
 
+# *** 修改：保护 stocks API ***
 @app.route('/api/stocks', methods=['GET', 'POST', 'DELETE'])
+@login_required
 def stocks():
     if request.method == 'POST':
         data = request.json
@@ -497,7 +576,7 @@ if __name__ == '__main__':
 EOF
 
     # -------------------------------------------------
-    # 写入 templates/index.html (不变)
+    # 写入 templates/index.html (v5.1 登出和 401 处理)
     # -------------------------------------------------
     echo -e "${GREEN}写入 Web UI (index.html)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/templates/index.html"
@@ -603,7 +682,7 @@ EOF
 <body>
 
 <div class="container">
-    <h1>库存监控设置</h1>
+    <h1>库存监控设置 <button id="logoutButton" style="float: right; font-size: 14px; padding: 8px 12px;" class="danger">退出登录</button></h1>
 
     <div id="loadingMessage" style="display: none; font-weight: bold; color: #3498db;">正在加载...</div>
 
@@ -631,7 +710,7 @@ EOF
         </div>
 
         <div class="grid-container">
-            <div class="form-group">
+            <div class.form-group">
                 <label for="telegrambot">Telegram Bot Token</label>
                 <input type="text" id="telegrambot" name="telegrambot" placeholder="当通知类型为 telegram 时填写">
             </div>
@@ -701,12 +780,51 @@ EOF
 
         document.getElementById('configForm').addEventListener('submit', saveConfig);
         document.getElementById('addStockForm').addEventListener('submit', addStock);
+        
+        // *** 新增：退出登录事件 ***
+        document.getElementById('logoutButton').addEventListener('click', logout);
     });
+
+    // *** 新增：封装 fetch 请求以处理 401 ***
+    async function fetchWithAuth(url, options = {}) {
+        const response = await fetch(url, options);
+        
+        if (response.status === 401) {
+            // 401 Unauthorized
+            alert('您的会话已过期，请重新登录。');
+            window.location.href = '/login'; // 重定向到登录页
+            throw new Error('Unauthorized'); // 停止后续执行
+        }
+        
+        return response;
+    }
+
+    // *** 新增：退出登录函数 ***
+    async function logout() {
+        try {
+            // 使用 POST
+            const response = await fetchWithAuth('/api/logout', { method: 'POST' });
+            
+            if (!response.ok) {
+                 const data = await response.json();
+                 throw new Error(data.message || 'Logout failed');
+            }
+            
+            window.location.href = '/login'; // 成功退出后重定向
+        } catch (error) {
+            console.error('Error logging out:', error);
+            if (error.message !== 'Unauthorized') { // 避免 401 弹窗两次
+                 alert('退出失败!');
+            }
+        }
+    }
+
 
     async function loadConfig() {
         try {
-            const response = await fetch(API_CONFIG);
-            if (!response.ok) throw new Error('Network response was not ok');
+            // *** 修改：使用带认证的 fetch ***
+            const response = await fetchWithAuth(API_CONFIG);
+            // if (!response.ok) throw new Error('Network response was not ok'); // 已在 fetchWithAuth 中处理
             const config = await response.json();
             
             // 保存到全局变量，以便保存时使用
@@ -722,15 +840,18 @@ EOF
             document.getElementById('custom_url').value = config.custom_url || '';
 
         } catch (error) {
-            console.error('Error loading config:', error);
-            alert('加载配置失败!');
+            if (error.message !== 'Unauthorized') {
+                console.error('Error loading config:', error);
+                alert('加载配置失败!');
+            }
         }
     }
 
     async function loadStocks() {
         try {
-            const response = await fetch(API_STOCKS);
-            if (!response.ok) throw new Error('Network response was not ok');
+            // *** 修改：使用带认证的 fetch ***
+            const response = await fetchWithAuth(API_STOCKS);
+            // if (!response.ok) throw new Error('Network response was not ok');
             const stocks = await response.json();
             
             const tableBody = document.querySelector('#stockTable tbody');
@@ -755,8 +876,10 @@ EOF
             });
 
         } catch (error) {
-            console.error('Error loading stocks:', error);
-            alert('加载商品列表失败!');
+            if (error.message !== 'Unauthorized') {
+                console.error('Error loading stocks:', error);
+                alert('加载商品列表失败!');
+            }
         }
     }
 
@@ -773,19 +896,22 @@ EOF
         currentConfig.custom_url = document.getElementById('custom_url').value;
         
         try {
-            const response = await fetch(API_CONFIG, {
+            // *** 修改：使用带认证的 fetch ***
+            const response = await fetchWithAuth(API_CONFIG, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(currentConfig) // 发送更新后的完整配置
             });
 
-            if (!response.ok) throw new Error('Network response was not ok');
+            // if (!response.ok) throw new Error('Network response was not ok');
             
             alert('配置已保存! 服务将自动重载。');
             loadConfig(); // 重新加载以确认
         } catch (error) {
-            console.error('Error saving config:', error);
-            alert('保存配置失败!');
+             if (error.message !== 'Unauthorized') {
+                console.error('Error saving config:', error);
+                alert('保存配置失败!');
+            }
         }
     }
 
@@ -800,20 +926,23 @@ EOF
         }
 
         try {
-            const response = await fetch(API_STOCKS, {
+            // *** 修改：使用带认证的 fetch ***
+            const response = await fetchWithAuth(API_STOCKS, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name, url })
             });
 
-            if (!response.ok) throw new Error('Network response was not ok');
+            // if (!response.ok) throw new Error('Network response was not ok');
 
             alert('商品已添加!');
             document.getElementById('addStockForm').reset(); // 重置表单
             loadStocks(); // 重新加载列表
         } catch (error) {
-            console.error('Error adding stock:', error);
-            alert('添加商品失败!');
+             if (error.message !== 'Unauthorized') {
+                console.error('Error adding stock:', error);
+                alert('添加商品失败!');
+            }
         }
     }
 
@@ -823,19 +952,22 @@ EOF
         }
 
         try {
-            const response = await fetch(API_STOCKS, {
+            // *** 修改：使用带认证的 fetch ***
+            const response = await fetchWithAuth(API_STOCKS, {
                 method: 'DELETE',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: name })
             });
 
-            if (!response.ok) throw new Error('Network response was not ok');
+            // if (!response.ok) throw new Error('Network response was not ok');
 
             alert('商品已删除!');
             loadStocks(); // 重新加载列表
         } catch (error) {
-            console.error('Error deleting stock:', error);
-            alert('删除商品失败!');
+             if (error.message !== 'Unauthorized') {
+                console.error('Error deleting stock:', error);
+                alert('删除商品失败!');
+            }
         }
     }
 
@@ -855,7 +987,85 @@ EOF
 EOF
 
     # -------------------------------------------------
-    # 写入 systemd 服务文件 (不变)
+    # 写入 templates/login.html (v5.1)
+    # -------------------------------------------------
+    echo -e "${GREEN}写入 Web UI (login.html)...${NC}"
+    cat << 'EOF' > "${INSTALL_DIR}/templates/login.html"
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Monitor - 登录</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; background-color: #f4f7f6; margin: 0; }
+        .login-container { background-color: #ffffff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); width: 100%; max-width: 400px; box-sizing: border-box; }
+        h1 { text-align: center; color: #2c3e50; margin-top: 0; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; font-weight: 600; margin-bottom: 8px; color: #555; }
+        input[type="text"], input[type="password"] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+        button { width: 100%; background-color: #3498db; color: white; padding: 12px 15px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; font-weight: 600; transition: background-color 0.3s ease; }
+        button:hover { background-color: #2980b9; }
+        #errorMessage { color: #e74c3c; text-align: center; margin-top: 15px; display: none; }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>Stock Monitor 登录</h1>
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+            <div class="form-group">
+                <label for="password">密码</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit">登录</button>
+            <p id="errorMessage"></p>
+        </form>
+    </div>
+
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const errorMessage = document.getElementById('errorMessage');
+
+            errorMessage.style.display = 'none';
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.status === 'success') {
+                    // 登录成功
+                    window.location.href = '/'; // 重定向到主仪表盘
+                } else {
+                    // 登录失败
+                    errorMessage.textContent = data.message || '登录失败，请重试。';
+                    errorMessage.style.display = 'block';
+                }
+            } catch (error) {
+                console.error('Error logging in:', error);
+                errorMessage.textContent = '登录时发生网络错误。';
+                errorMessage.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
+EOF
+
+
+    # -------------------------------------------------
+    # 写入 systemd 服务文件 (v5.1 增加环境变量)
     # -------------------------------------------------
     echo -e "${GREEN}创建 systemd 服务: ${SERVICE_NAME}.service${NC}"
     
@@ -871,6 +1081,8 @@ User=root
 WorkingDirectory=${INSTALL_DIR}
 Environment="MONITOR_PORT=${MONITOR_PORT}"
 Environment="PROXY_HOST=${PROXY_HOST}"
+Environment="ADMIN_USER=${ADMIN_USER}"
+Environment="ADMIN_PASS=${ADMIN_PASS}"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=${VENV_DIR}/bin/python web.py
 Restart=always
@@ -895,13 +1107,14 @@ EOF
     echo -e "${GREEN}================ 安装完成 ==================${NC}"
     echo -e "服务已安装到: ${INSTALL_DIR}"
     echo -e "Web 界面正在运行于: ${YELLOW}http://<您的IP>:${MONITOR_PORT}${NC}"
+    echo -e "您的登录用户名: ${YELLOW}${ADMIN_USER}${NC}"
     echo -e "配置文件路径: ${YELLOW}${CONFIG_FILE}${NC}"
     if [ -n "$PROXY_HOST" ]; then
         echo -e "FlareSolverr 代理位于: ${YELLOW}${PROXY_HOST}${NC}"
     fi
     echo -e ""
     echo -e "您现在可以在系统的任何位置使用 ${GREEN}sm${NC} 命令来管理此服务。"
-    echo -e "${GREEN}网页界面现在功能齐全！请访问上述 URL 进行配置。${NC}"
+    echo -e "${GREEN}请访问上述 URL 并使用您设置的凭据登录。${NC}"
 }
 
 # 2. 卸载服务
@@ -919,12 +1132,29 @@ uninstall_monitor() {
         echo -e "${YELLOW}未找到 systemd 服务文件。${NC}"
     fi
 
-    if [ -d "$INSTALL_DIR" ]; then
-        echo -e "${RED}删除安装目录: ${INSTALL_DIR}${NC}"
-        rm -rf "$INSTALL_DIR"
+    # *** v5.2 新增：询问是否保留配置 ***
+    echo -e "${YELLOW}-------------------------------------------${NC}"
+    read -p "您是否希望保留用户配置文件 (${DATA_DIR})？ (y/N): " keep_config
+    echo -e "${YELLOW}-------------------------------------------${NC}"
+
+    if [[ "$keep_config" =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}正在保留数据目录: ${DATA_DIR}${NC}"
+        # 删除除 data 目录外的所有内容
+        rm -rf "${INSTALL_DIR}/venv"
+        rm -f "${INSTALL_DIR}/core.py"
+        rm -f "${INSTALL_DIR}/web.py"
+        rm -rf "${INSTALL_DIR}/templates"
+        echo -e "${YELLOW}脚本和组件已删除，数据已保留。${NC}"
     else
-        echo -e "${YELLOW}未找到安装目录。${NC}"
+        echo -e "${YELLOW}未选择保留数据。${NC}"
+        if [ -d "$INSTALL_DIR" ]; then
+            echo -e "${RED}删除安装目录: ${INSTALL_DIR}${NC}"
+            rm -rf "$INSTALL_DIR"
+        else
+            echo -e "${YELLOW}未找到安装目录。${NC}"
+        fi
     fi
+    # *** 卸载逻辑修改结束 ***
 
     if [ -f "$SM_COMMAND_PATH" ]; then
         echo -e "${RED}删除快捷命令: ${SM_COMMAND_PATH}${NC}"
@@ -996,6 +1226,7 @@ edit_stocks() {
     echo -e "修改 'config' 部分来更改推送 Token 或频率。"
     echo -e "${GREEN}服务将在下个监控周期 (最多等待 frequency 秒) 自动加载您的更改。${NC}"
     echo -e "${GREEN}建议：现在使用网页界面进行配置更方便。${NC}"
+    echo -e "${YELLOW}如需修改 Web UI 登录凭据，请编辑 ${SERVICE_FILE} 文件中的 'ADMIN_USER' 和 'ADMIN_PASS' 环境变量，然后运行 'systemctl daemon-reload' 和 'systemctl restart ${SERVICE_NAME}'。${NC}"
     echo -e "按任意键继续..."
     read -n 1
     
@@ -1022,7 +1253,7 @@ edit_stocks() {
 show_management_menu() {
     clear
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 管理菜单 (sm) - v5${NC}"
+    echo -e "${GREEN}   Stock Monitor 管理菜单 (sm) - v5.2${NC}"
     echo -e "${GREEN}===========================================${NC}"
     echo -e " 1. ${GREEN}安装/升级服务 (自动 Docker/FlareSolverr)${NC}"
     echo -e " 2. ${RED}卸载服务${NC}"
@@ -1061,7 +1292,7 @@ show_management_menu() {
 show_install_menu() {
     clear
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 安装程序 (v5)${NC}"
+    echo -e "${GREEN}   Stock Monitor 安装程序 (v5.2)${NC}"
     echo -e "${GREEN}===========================================${NC}"
     echo -e "${YELLOW}服务尚未安装。${NC}\n"
     echo -e " 1. ${GREEN}安装 Stock Monitor (自动 Docker/FlareSolverr)${NC}"
