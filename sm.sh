@@ -3,7 +3,7 @@
 # =================================================================
 # Stock Monitor (Pushplus 版) 多功能管理脚本
 # 快捷命令: sm
-# (v5.2 - 增加卸载保留配置 / 安装检测旧配置)
+# (v5.4 - 自动重启时间改为交互式设置)
 # =================================================================
 
 # 定义颜色
@@ -46,7 +46,7 @@ is_installed() {
 # 1. 安装服务
 install_monitor() {
     check_root
-    echo -e "${GREEN}1. 开始安装 Stock Monitor (v5.2 - 增加配置检测)...${NC}"
+    echo -e "${GREEN}1. 开始安装 Stock Monitor (v5.4)...${NC}"
 
     if is_installed; then
         echo -e "${YELLOW}警告：检测到已安装的服务。将首先执行卸载...${NC}"
@@ -1163,6 +1163,15 @@ uninstall_monitor() {
         echo -e "${YELLOW}未找到快捷命令。${NC}"
     fi
 
+    # *** v5.3 新增：卸载时移除 systemd drop-in 配置 ***
+    local DROP_IN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+    if [ -d "$DROP_IN_DIR" ]; then
+        echo -e "${RED}删除 systemd 覆盖配置目录: ${DROP_IN_DIR}${NC}"
+        rm -rf "$DROP_IN_DIR"
+        systemctl daemon-reload
+    fi
+    # *** 卸载逻辑修改结束 ***
+
     echo -e "${YELLOW}注意：此卸载脚本不会删除 Docker 或 FlareSolverr 容器。${NC}"
     echo -e "${YELLOW}如果您想一并删除 FlareSolverr，请运行:${NC}"
     echo -e "${YELLOW}docker rm -f flaresolverr${NC}"
@@ -1246,6 +1255,87 @@ edit_stocks() {
 }
 
 # =================================================================
+# v5.4 修改：设置自动重启 (交互式)
+# =================================================================
+setup_auto_restart() {
+    check_root
+    
+    local DROP_IN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
+    local OVERRIDE_FILE="${DROP_IN_DIR}/auto-restart.conf"
+
+    clear
+    echo -e "${GREEN}--- 设置服务自动重启 ---${NC}"
+    echo -e "此功能使用 systemd 的 'RuntimeMaxSec' 属性。"
+    echo -e "服务将在(累积)运行指定时间后自动重启。"
+    echo -e "${YELLOW}这有助于在不确定的情况下防止潜在的内存泄漏。${NC}\n"
+
+    # v5.4 新增：检查并显示当前设置
+    local current_setting="未设置"
+    if [ -f "$OVERRIDE_FILE" ]; then
+        # 从配置文件中提取 RuntimeMaxSec 的值
+        current_setting=$(grep "RuntimeMaxSec" "$OVERRIDE_FILE" | cut -d'=' -f2)
+        if [ -z "$current_setting" ]; then
+            current_setting="配置错误 (文件存在但值为空)"
+        fi
+    fi
+    echo -e "当前设置: ${YELLOW}${current_setting}${NC}\n"
+    
+    echo -e " 1. ${GREEN}设置自定义重启时间 (单位: 小时)${NC}"
+    echo -e " 2. ${YELLOW}禁用自动重启功能${NC}"
+    echo -e " 0. ${GREEN}返回主菜单${NC}"
+    read -p "请选择 [0-2]: " restart_choice
+
+    case $restart_choice in
+        1)
+            read -p "请输入您希望的重启间隔 (单位: 小时, 必须为正整数, 例如: 8): " custom_hours
+            
+            # 验证输入是否为大于0的整数
+            if ! [[ "$custom_hours" =~ ^[1-9][0-9]*$ ]]; then
+                echo -e "${RED}错误：输入无效。请输入一个大于0的整数。${NC}"
+                return
+            fi
+
+            echo -e "${GREEN}正在设置每 ${custom_hours} 小时重启...${NC}"
+            mkdir -p "$DROP_IN_DIR"
+            cat << EOF > "$OVERRIDE_FILE"
+[Service]
+# This file is managed by the 'sm' script (option 10)
+RuntimeMaxSec=${custom_hours}h
+Restart=always
+EOF
+            echo -e "${GREEN}设置成功！${NC}"
+            ;;
+        2)
+            echo -e "${YELLOW}正在禁用自动重启...${NC}"
+            if [ -f "$OVERRIDE_FILE" ]; then
+                rm -f "$OVERRIDE_FILE"
+                # 尝试删除空目录，> /dev/null 2>&1 忽略错误
+                rmdir "$DROP_IN_DIR" > /dev/null 2>&1
+                echo -e "${GREEN}已禁用。${NC}"
+            else
+                echo -e "${YELLOW}自动重启功能尚未启用，无需操作。${NC}"
+                return # 无需重载
+            fi
+            ;;
+        0)
+            echo -e "${GREEN}已取消。${NC}"
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选项。${NC}"
+            return
+            ;;
+    esac
+    
+    echo -e "${GREEN}正在重载 systemd 配置...${NC}"
+    systemctl daemon-reload
+    echo -e "${GREEN}正在重启 ${SERVICE_NAME} 以应用新设置...${NC}"
+    systemctl restart "$SERVICE_NAME"
+    echo -e "${GREEN}操作完成。${NC}"
+}
+
+
+# =================================================================
 # 菜单显示
 # =================================================================
 
@@ -1253,7 +1343,7 @@ edit_stocks() {
 show_management_menu() {
     clear
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 管理菜单 (sm) - v5.2${NC}"
+    echo -e "${GREEN}   Stock Monitor 管理菜单 (sm) - v5.4${NC}" # <-- v5.4
     echo -e "${GREEN}===========================================${NC}"
     echo -e " 1. ${GREEN}安装/升级服务 (自动 Docker/FlareSolverr)${NC}"
     echo -e " 2. ${RED}卸载服务${NC}"
@@ -1264,10 +1354,11 @@ show_management_menu() {
     echo -e " 7. ${GREEN}显示服务实时日志${NC}"
     echo -e " 8. ${GREEN}显示当前监控项目列表${NC}"
     echo -e " 9. ${YELLOW}修改配置 (nano - 专家模式)${NC}"
+    echo -e " 10. ${GREEN}设置自动重启 (自定义/禁用)${NC}" # <-- v5.4 修改
     echo -e " 0. ${GREEN}退出脚本${NC}"
     echo -e "${GREEN}-------------------------------------------${NC}"
     echo -e "${GREEN}推荐使用网页界面管理配置。${NC}"
-    read -p "请输入您的选择 [0-9]: " choice
+    read -p "请输入您的选择 [0-10]: " choice
     
     case $choice in
         1) install_monitor ;;
@@ -1279,8 +1370,9 @@ show_management_menu() {
         7. | 7) show_logs ;;
         8. | 8) list_stocks ;;
         9. | 9) edit_stocks ;;
+        10) setup_auto_restart ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请输入 0-9。${NC}" ;;
+        *) echo -e "${RED}无效选项，请输入 0-10。${NC}" ;;
     esac
     
     echo -e "\n按任意键返回菜单..."
@@ -1292,7 +1384,7 @@ show_management_menu() {
 show_install_menu() {
     clear
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 安装程序 (v5.2)${NC}"
+    echo -e "${GREEN}   Stock Monitor 安装程序 (v5.4)${NC}" # <-- v5.4
     echo -e "${GREEN}===========================================${NC}"
     echo -e "${YELLOW}服务尚未安装。${NC}\n"
     echo -e " 1. ${GREEN}安装 Stock Monitor (自动 Docker/FlareSolverr)${NC}"
