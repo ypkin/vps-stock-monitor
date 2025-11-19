@@ -3,7 +3,7 @@
 # =================================================================
 # Stock Monitor (Pushplus 版) 多功能管理脚本
 # 快捷命令: sm
-# (v5.9 - 逻辑优化、拼写修复、依赖安装防卡死)
+# (v6.6 - 安装结束显示账号密码、状态栏、多线程调度)
 # =================================================================
 
 # 定义脚本自身输出颜色
@@ -46,15 +46,19 @@ is_installed() {
 # 1. 安装服务
 install_monitor() {
     check_root
-    echo -e "${GREEN}1. 开始安装 Stock Monitor (v5.9)...${NC}"
+    echo -e "${GREEN}1. 开始安装 Stock Monitor (v6.6)...${NC}"
 
     if is_installed; then
         echo -e "${YELLOW}警告：检测到已安装的服务。将首先执行卸载...${NC}"
         uninstall_monitor
+        # 检查是否真的卸载了
+        if is_installed; then
+            echo -e "${RED}卸载已取消，终止安装。${NC}"
+            exit 0
+        fi
     fi
 
     echo -e "${GREEN}更新软件包列表并安装依赖 (python, pip, venv, curl, jq)...${NC}"
-    # 优化：使用非交互模式防止 apt 卡住
     export DEBIAN_FRONTEND=noninteractive
     apt update
     apt install -y python3 python3-pip python3-venv curl jq
@@ -67,100 +71,81 @@ install_monitor() {
     read -p "请输入您希望 Web 服务运行的端口 (1-65535，默认 5000): " MONITOR_PORT
     MONITOR_PORT=${MONITOR_PORT:-5000}
 
-    # *** v5.1 凭据设置 ***
+    # *** 凭据设置 ***
     echo -e "${GREEN}-------------------------------------------${NC}"
     echo -e "${YELLOW}为您的 Web UI 设置登录凭据。${NC}"
     read -p "请输入管理员用户名 (默认: admin): " ADMIN_USER
     ADMIN_USER=${ADMIN_USER:-admin}
     read -s -p "请输入管理员密码 (默认: password): " ADMIN_PASS
-    echo "" # 换行
+    echo "" 
     ADMIN_PASS=${ADMIN_PASS:-password}
     echo -e "${GREEN}凭据设置完成。${NC}"
-    echo -e "${GREEN}-------------------------------------------${NC}"
 
-    # *** 自动 FlareSolverr 逻辑 (v4) ***
+    # *** 自动 FlareSolverr 逻辑 (强制安装) ***
     echo -e "${GREEN}-------------------------------------------${NC}"
-    echo -e "${YELLOW}FlareSolverr (可选) 是一个可以绕过 403 错误 (如 Cloudflare) 的服务。${NC}"
-    read -p "您是否需要自动安装 FlareSolverr (将使用 Docker)？ (y/N): " install_flaresolverr
+    echo -e "${GREEN}正在检测并自动配置 FlareSolverr (Docker)...${NC}"
     
-    PROXY_HOST="" # 默认值
+    PROXY_HOST="" 
     
-    if [[ "$install_flaresolverr" =~ ^[Yy]$ ]]; then
-        echo -e "${GREEN}正在检查 Docker...${NC}"
+    # 1. 检查并安装 Docker
+    if ! command -v docker &> /dev/null; then
+        echo -e "${YELLOW}未检测到 Docker，正在自动安装...${NC}"
+        curl -fsSL https://get.docker.com | sh
         if ! command -v docker &> /dev/null; then
-            echo -e "${YELLOW}未检测到 Docker，正在尝试自动安装...${NC}"
-            curl -fsSL https://get.docker.com | sh
-            if ! command -v docker &> /dev/null; then
-                echo -e "${RED}Docker 安装失败。请手动安装 Docker 后重试。${NC}"
-                exit 1
-            fi
-            echo -e "${GREEN}Docker 安装成功。${NC}"
-        else
-            echo -e "${GREEN}Docker 已安装。${NC}"
+            echo -e "${RED}Docker 安装失败。请手动安装 Docker 后重试。${NC}"
+            exit 1
         fi
-        
-        echo -e "${GREEN}正在通过 Docker 部署/更新 FlareSolverr...${NC}"
-        echo -e "${YELLOW}拉取最新镜像 (ghcr.io/flaresolverr/flaresolverr:latest)...${NC}"
-        docker pull ghcr.io/flaresolverr/flaresolverr:latest
-        
-        echo -e "${YELLOW}停止并移除旧的 'flaresolverr' 容器 (如果存在)...${NC}"
-        docker rm -f flaresolverr &> /dev/null || true
-        
-        echo -e "${GREEN}启动新的 FlareSolverr 容器 (flaresolverr)...${NC}"
-        docker run -d \
-          --name flaresolverr \
-          -p 8191:8191 \
-          -e LOG_LEVEL=info \
-          --restart always \
-          ghcr.io/flaresolverr/flaresolverr:latest
-          
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}FlareSolverr 启动成功！${NC}"
-            PROXY_HOST="http://127.0.0.1:8191"
-            echo -e "${GREEN}已自动设置 PROXY_HOST 为: ${PROXY_HOST}${NC}"
-        else
-            echo -e "${RED}FlareSolverr 容器启动失败。请检查 Docker 日志。${NC}"
-            echo -e "${YELLOW}将继续安装，但代理功能不可用。${NC}"
-            PROXY_HOST=""
-        fi
+        echo -e "${GREEN}Docker 安装成功。${NC}"
     else
-        echo -e "${GREEN}已跳过 FlareSolverr 安装。${NC}"
+        echo -e "${GREEN}Docker 已安装。${NC}"
+    fi
+    
+    # 2. 安装/重启 FlareSolverr 容器
+    echo -e "${GREEN}正在部署/更新 FlareSolverr 容器...${NC}"
+    
+    docker pull ghcr.io/flaresolverr/flaresolverr:latest
+    docker rm -f flaresolverr &> /dev/null || true
+    
+    docker run -d \
+      --name flaresolverr \
+      -p 8191:8191 \
+      -e LOG_LEVEL=info \
+      --restart always \
+      ghcr.io/flaresolverr/flaresolverr:latest
+      
+    if [ $? -eq 0 ]; then
+        PROXY_HOST="http://127.0.0.1:8191"
+        echo -e "${GREEN}FlareSolverr 部署成功! 代理地址: ${PROXY_HOST}${NC}"
+    else
+        echo -e "${RED}FlareSolverr 容器启动失败。请检查 Docker 日志。${NC}"
+        PROXY_HOST=""
     fi
     echo -e "${GREEN}-------------------------------------------${NC}"
-    # *** 自动化逻辑结束 ***
 
     echo -e "${GREEN}创建目录: ${INSTALL_DIR}, ${INSTALL_DIR}/templates, ${DATA_DIR}${NC}"
     mkdir -p "${INSTALL_DIR}/templates"
     mkdir -p "${DATA_DIR}"
 
-    # *** v5.2 新增：检测旧配置 ***
+    # *** 检测旧配置 ***
     echo -e "${GREEN}-------------------------------------------${NC}"
     if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}检测到先前保留的配置文件: ${CONFIG_FILE}${NC}"
-        echo -e "${GREEN}安装程序将跳过创建新配置，服务启动后将自动加载此文件。${NC}"
+        echo -e "${YELLOW}检测到旧配置文件，将保留使用。${NC}"
     else
-        echo -e "${GREEN}未检测到旧配置，服务首次启动时将自动创建。${NC}"
+        echo -e "${GREEN}未检测到旧配置，将创建默认配置。${NC}"
     fi
     echo -e "${GREEN}-------------------------------------------${NC}"
-    # *** 检测结束 ***
 
     echo -e "${GREEN}创建 Python 虚拟环境...${NC}"
     python3 -m venv "$VENV_DIR"
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}创建虚拟环境失败。${NC}"
-        exit 1
-    fi
-
-    echo -e "${GREEN}激活虚拟环境并安装 Python 依赖库...${NC}"
     source "${VENV_DIR}/bin/activate"
     pip install --upgrade pip
     pip install Flask requests beautifulsoup4
     deactivate
 
     # -------------------------------------------------
-    # 写入 core.py (v5.9 修复 Typo，优化结构)
+    # 写入 core.py (独立调度版)
     # -------------------------------------------------
-    echo -e "${GREEN}写入 core.py (v5.9)...${NC}"
+    echo -e "${GREEN}写入 core.py...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/core.py"
 import json
 import time
@@ -169,33 +154,29 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 class StockMonitor:
     def __init__(self, config_path='data/config.json'):
         self.config_path = config_path
-        self.blocked_urls = set()  # 存储已经代理过的URL
-        self.proxy_host = os.getenv("PROXY_HOST", None)  # 从环境变量读取
+        self.blocked_urls = set()
+        self.proxy_host = os.getenv("PROXY_HOST", None)
+        self.lock = threading.Lock()
         
-        # 优化：预定义 Headers，避免每次请求重复创建
         self.headers = {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-            'cache-control': 'max-age=0',
-            'priority': 'u=0, i',
-            'sec-ch-ua': '"Chromium";v="130", "Microsoft Edge";v="130", "Not?A_Brand";v="99"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'cross-site',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
         }
         
+        self.next_run_times = {} 
+        self.running_tasks = set() 
+        self.executor = None
+        self.current_max_workers = 0
+        
         self.load_config()
 
-    # 加载配置文件
     def load_config(self):
         config_dir = os.path.dirname(self.config_path)
         if not os.path.exists(config_dir):
@@ -207,244 +188,178 @@ class StockMonitor:
         try:
             with open(self.config_path, 'r') as f:
                 content = f.read().strip()
-                if not content: # 检查文件是否为空
-                    raise ValueError("Empty configuration file")
+                if not content: raise ValueError("Empty config")
                 self.config = json.loads(content)
+            
             self.frequency = int(self.config['config'].get('frequency', 300))
-            print("配置已加载", flush=True) 
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"配置文件 {self.config_path} 格式错误或为空 ({e})。正在重建默认配置。", flush=True)
-            self.create_initial_config() 
-            # 递归调用尝试重新加载
-            self.load_config()
+            new_max_workers = int(self.config['config'].get('threads', 3))
+            
+            if self.executor is None or new_max_workers != self.current_max_workers:
+                print(f"初始化/更新线程池: {self.current_max_workers} -> {new_max_workers}", flush=True)
+                if self.executor:
+                    self.executor.shutdown(wait=False)
+                self.executor = ThreadPoolExecutor(max_workers=new_max_workers)
+                self.current_max_workers = new_max_workers
+                
         except Exception as e:
-            print(f"加载配置时出错: {e}", flush=True)
-            # 发生未知错误时，避免死循环，使用内存默认值
-            self.config = {"config": {"frequency": 30}, "stock": {}}
-            self.frequency = 30
+            print(f"加载配置出错: {e}", flush=True)
+            self.create_initial_config()
+            self.load_config()
 
-    # 创建初始的配置文件
     def create_initial_config(self):
         default_config = {
             "config": {
                 "frequency": 30,
+                "threads": 3,
                 "notice_type": "pushplus",
                 "pushplus_token": "",
                 "telegrambot": "",
                 "chat_id": "",
-                "wechat_key": "",
                 "custom_url": ""
             },
             "stock": {}
         }
         with open(self.config_path, 'w') as f:
             json.dump(default_config, f, indent=4)
-        print("配置文件已生成：", self.config_path, flush=True)
         
-    # 保存配置文件
     def save_config(self):
-        with open(self.config_path, 'w') as f:
-            json.dump(self.config, f, indent=4)
-        print("配置已更新", flush=True)
+        with self.lock:
+            with open(self.config_path, 'w') as f:
+                json.dump(self.config, f, indent=4)
 
-    # 封装一个模拟的 Response 对象，用于在代理失败时返回
     def _mock_failed_response(self, status_code, content):
         class MockResponse:
-            def __init__(self, status_code, content):
-                self.status_code = status_code
-                self.content = content
+            def __init__(self, s, c): self.status_code, self.content = s, c
         return MockResponse(status_code, content), ""
 
-    # 检查商品库存状态
     def check_stock(self, url, alert_class="alert alert-danger error-heading"):
-        # 内部函数：处理 FlareSolverr 代理请求
         def fetch_flaresolverr(url):
-            print(f"Using proxy for {url}", flush=True)
             headers = {"Content-Type": "application/json"}
-            data = {
-                "cmd": "request.get",
-                "url": url,
-                "maxTimeout": 120000  # 增加超时到 120 秒
-            }
+            data = {"cmd": "request.get", "url": url, "maxTimeout": 120000}
             try:
                 response = requests.post(f'{self.proxy_host}/v1', headers=headers, json=data)
                 resp_json = response.json()
-
-                # 健壮性检查：确保 FlareSolverr 返回了成功状态
                 if resp_json.get('status') == 'ok' and 'solution' in resp_json:
-                    # 成功
                     return response, resp_json['solution']['response']
-                else:
-                    # FlareSolverr 报告了错误
-                    error_message = resp_json.get('message', 'Unknown FlareSolverr error')
-                    print(f"FlareSolverr failed: {error_message}", flush=True)
-                    return self._mock_failed_response(500, f"FlareSolverr failed: {error_message}")
-
-            except requests.exceptions.ConnectionError as e:
-                print(f"FlareSolverr connection error: {e}", flush=True)
-                return self._mock_failed_response(503, f"FlareSolverr connection error: {e}")
+                return self._mock_failed_response(500, "FlareSolverr failed")
             except Exception as e:
-                # 捕获其他所有异常
-                print(f"FlareSolverr general error: {e}", flush=True)
-                return self._mock_failed_response(500, f"FlareSolverr general error: {e}")
-
+                return self._mock_failed_response(503, str(e))
 
         try:
+            content = None
+            use_proxy = False
+            if self.proxy_host:
+                with self.lock:
+                    if url in self.blocked_urls: use_proxy = True
+            
+            response = None
+            
             if not self.proxy_host:
-                response = requests.get(url, headers=self.headers)
-                print(response.status_code, flush=True)
-                if response.status_code == 403:
-                    print(f"Error fetching {url}: Status code {response.status_code}. Try to set host.", flush=True)
-                    return None
+                response = requests.get(url, headers=self.headers, timeout=30)
+                if response.status_code == 403: return None
                 content = response.content
-            else:   
-                if url in self.blocked_urls:
-                    print('url in set', flush=True)
+            elif use_proxy:
+                response, content = fetch_flaresolverr(url)
+                if random.random() < 0.05:
+                    with self.lock:
+                        if url in self.blocked_urls: self.blocked_urls.remove(url)
+            else:
+                response = requests.get(url, headers=self.headers, timeout=30)
+                if response.status_code == 403:
                     response, content = fetch_flaresolverr(url)
-                    if random.random() < 0.05:
-                        print(f"Random chance hit: Deleting {url} from blocked list.", flush=True)
-                        self.blocked_urls.remove(url)
-                            
-                else:
-                    response = requests.get(url, headers=self.headers)
-                    if response.status_code == 403:
-                        print(f'Return  {response.status_code}', flush=True)
-                        response, content = fetch_flaresolverr(url)
-                        if response.status_code == 200:
-                            self.blocked_urls.add(url)
-                    content = response.content
-                
-                if response.status_code != 200:
-                    print(f"Error fetching {url} via proxy. Status code {response.status_code}", flush=True)
-                    return None
+                    if response.status_code == 200:
+                        with self.lock: self.blocked_urls.add(url)
+                content = response.content
+            
+            if not response or response.status_code != 200: return None
 
             soup = BeautifulSoup(content, 'html.parser')
-            if '宝塔防火墙正在检查您的访问' in str(content):
-                print('被宝塔防火墙拦截', flush=True)
-                return None
+            if '宝塔防火墙' in str(content): return None
 
             out_of_stock = soup.find('div', class_=alert_class)
-            if out_of_stock:
-                return False  # 缺货
+            if out_of_stock: return False
 
             out_of_stock_keywords = ['out of stock', '缺货', 'sold out', 'no stock', '缺貨中']
             page_text = soup.get_text().lower()
             for keyword in out_of_stock_keywords:
-                if keyword in page_text:
-                    return False  # 缺货
+                if keyword in page_text: return False
 
-            return True  # 有货
-            
+            return True
         except Exception as e:
             print(f"Error fetching {url}: {e}", flush=True)
             return None
 
-    # 推送库存变更通知
     def send_message(self, message):
-        notice_type = self.config['config'].get('notice_type', 'pushplus')
-        
-        if notice_type == 'pushplus':
-            pushplus_token = self.config['config'].get('pushplus_token')
-            if not pushplus_token:
-                print("Pushplus token not found in configuration.", flush=True)
-                return
-            url = "http://www.pushplus.plus/send"
-            payload = {"token": pushplus_token, "title": "库存变更通知", "content": message}
-            try:
-                response = requests.get(url, params=payload)
-                if response.status_code == 200 and response.json().get('code') == 200:
-                    print(f"Message sent successfully via Pushplus: {message}", flush=True)
-                else:
-                    print(f"Failed to send message via Pushplus: {response.text}", flush=True)
-            except Exception as e:
-                print(f"Error sending message via Pushplus: {e}", flush=True)
-        
-        elif notice_type == 'telegram':
-            telegram_token = self.config['config'].get('telegrambot')
-            chat_id = self.config['config'].get('chat_id')
-            url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-            payload = {"chat_id": chat_id, "text": message}
-            try:
-                response = requests.get(url, params=payload)
-                if response.status_code == 200:
-                    print("Telegram message sent successfully", flush=True)
-                else:
-                    print(f"Failed to send message via Telegram: {response.status_code}", flush=True)
-            except Exception as e:
-                print(f"Error sending message via Telegram: {e}", flush=True)
-        
-        elif notice_type == 'wechat':
-            wechat_key = self.config['config'].get('wechat_key')
-            if wechat_key:
-                # 修复 v5.8 及之前的 URL 拼写错误 (httpsas -> https)
-                url = f"https://xizhi.qqoq.net/{wechat_key}.send"
-                payload = {'title': '库存变更通知', 'content': message}
-                try:
-                    response = requests.get(url, params=payload)
-                    if response.status_code == 200:
-                        print(f"Message sent successfully to WeChat: {message}", flush=True)
-                    else:
-                        print(f"Failed to send message via WeChat: {response.status_code}", flush=True)
-                except Exception as e:
-                    print(f"Error sending message via WeChat: {e}", flush=True)
-            else:
-                print("WeChat key not found in configuration.", flush=True)
-        
-        elif notice_type == 'custom':
-            custom_url = self.config['config'].get('custom_url')
-            if custom_url:
-                custom_url_with_message = custom_url.replace("{message}", message)
-                try:
-                    response = requests.get(custom_url_with_message)
-                    if response.status_code == 200:
-                        print(f"Custom notification sent successfully: {message}", flush=True)
-                    else:
-                        print(f"Failed to send custom message: {response.status_code}", flush=True)
-                except Exception as e:
-                    print(f"Error sending custom message: {e}", flush=True)
-            else:
-                print("Custom URL not found in configuration.", flush=True)
+        cfg = self.config['config']
+        nt = cfg.get('notice_type', 'pushplus')
+        try:
+            if nt == 'pushplus' and cfg.get('pushplus_token'):
+                requests.get("http://www.pushplus.plus/send", params={"token": cfg['pushplus_token'], "title": "库存通知", "content": message})
+            elif nt == 'telegram' and cfg.get('telegrambot') and cfg.get('chat_id'):
+                requests.get(f"https://api.telegram.org/bot{cfg['telegrambot']}/sendMessage", params={"chat_id": cfg['chat_id'], "text": message})
+            elif nt == 'wechat' and cfg.get('wechat_key'):
+                requests.get(f"https://xizhi.qqoq.net/{cfg['wechat_key']}.send", params={'title': '库存通知', 'content': message})
+            elif nt == 'custom' and cfg.get('custom_url'):
+                requests.get(cfg['custom_url'].replace("{message}", message))
+            print(f"通知已发送: {message.splitlines()[0]}", flush=True)
+        except Exception as e:
+            print(f"发送通知失败: {e}", flush=True)
 
-    # 刷新配置文件中的库存状态
-    def update_stock_status(self):
-        has_change = False
-        if 'stock' not in self.config:
-            print("配置文件中缺少 'stock' 键，跳过检查。", flush=True)
+    def process_single_stock(self, name, item):
+        url = item['url']
+        last_status = item.get('status', False)
+        current_status = self.check_stock(url)
+        
+        with self.lock:
+            self.running_tasks.discard(name)
+
+        if current_status is None:
+            print(f"[{name}] 检测失败 (网络或反爬)", flush=True)
             return
-            
-        for name, item in self.config['stock'].items():
-            url = item['url']
-            last_status = item.get('status',False)
-            current_status = self.check_stock(url)
 
-            if current_status is not None and current_status != last_status:
-                status_text = "有货" if current_status else "缺货"
-                message = f"{name} 库存变动 {status_text}\n购买 {url}"
-                self.send_message(message)
-                self.config['stock'][name]['status'] = current_status
-                has_change = True
-            
-            # 仅打印状态，时间戳由 systemd 负责
-            print(f"{name}: {'有货' if current_status else '缺货'}", flush=True)
+        if current_status != last_status:
+            status_text = "有货" if current_status else "缺货"
+            message = f"{name} 库存变动 {status_text}\n购买 {url}"
+            print(f"[{name}] 状态改变! -> {status_text}", flush=True)
+            self.send_message(message)
+            with self.lock:
+                if name in self.config['stock']: 
+                    self.config['stock'][name]['status'] = current_status
+                with open(self.config_path, 'w') as f:
+                    json.dump(self.config, f, indent=4)
+        else:
+            print(f"[{name}] 状态无变化: {'有货' if current_status else '缺货'}", flush=True)
 
-        if has_change:
-            self.save_config()
-
-    # 监控主循环
     def start_monitoring(self):
-        print("开始库存监控...", flush=True)
+        print("启动独立调度监控器...", flush=True)
         while True:
-            print("检测库存", flush=True)
-            try: 
-                self.load_config()
-                self.update_stock_status()
-            except Exception as e: 
-                print(f'循环中发生错误 {str(e)}', flush=True)
-            time.sleep(self.frequency)
+            try:
+                self.load_config() 
+                current_time = time.time()
+                stocks = self.config.get('stock', {})
+                
+                active_names = set(stocks.keys())
+                self.next_run_times = {k:v for k,v in self.next_run_times.items() if k in active_names}
+                
+                for name, item in stocks.items():
+                    is_running = False
+                    with self.lock:
+                        if name in self.running_tasks:
+                            is_running = True
+                    if is_running: continue 
+                        
+                    next_run = self.next_run_times.get(name, 0)
+                    if current_time >= next_run:
+                        with self.lock:
+                            self.running_tasks.add(name)
+                        self.executor.submit(self.process_single_stock, name, item)
+                        self.next_run_times[name] = current_time + self.frequency
+                time.sleep(1)
+            except Exception as e:
+                print(f"主循环异常: {e}", flush=True)
+                time.sleep(5) 
 
-    # 外部重载配置方法
     def reload(self):
-        print("重新加载配置...", flush=True)
         self.load_config()
 
 if __name__ == "__main__":
@@ -455,7 +370,7 @@ EOF
     # -------------------------------------------------
     # 写入 web.py
     # -------------------------------------------------
-    echo -e "${GREEN}写入 web.py (v5.9)...${NC}"
+    echo -e "${GREEN}写入 web.py...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/web.py"
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from core import StockMonitor
@@ -465,65 +380,50 @@ import os
 from functools import wraps
 
 app = Flask(__name__)
-# 警告：在生产环境中建议使用固定的 Secret Key
 app.secret_key = os.urandom(24) 
 monitor = StockMonitor()
 
-# 从环境变量读取凭据
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "password")
 
-# 避免与 Vue/Angular 等前端框架冲突 (虽然这里只用 Jinja2)
 app.jinja_env.variable_start_string = '<<'
 app.jinja_env.variable_end_string = '>>'
 
-# 登录装饰器
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session:
-            # 如果是 API 请求，返回 401
             if request.path.startswith('/api/'):
                 return jsonify({"status": "error", "message": "Unauthorized"}), 401
-            # 否则重定向到登录页
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated_function
 
-# 登录页面路由
 @app.route('/login')
 def login():
     if 'logged_in' in session:
         return redirect(url_for('index'))
     return render_template('login.html')
 
-# 登录 API 路由
 @app.route('/api/login', methods=['POST'])
 def api_login():
     data = request.json
-    username = data.get('username')
-    password = data.get('password')
-
-    if username == ADMIN_USER and password == ADMIN_PASS:
+    if data.get('username') == ADMIN_USER and data.get('password') == ADMIN_PASS:
         session['logged_in'] = True
         return jsonify({"status": "success", "message": "Login successful"})
-    else:
-        return jsonify({"status": "error", "message": "Invalid credentials"}), 403
+    return jsonify({"status": "error", "message": "Invalid credentials"}), 403
 
-# 登出 API 路由
 @app.route('/api/logout', methods=['POST'])
 @login_required
 def api_logout():
     session.pop('logged_in', None)
     return jsonify({"status": "success", "message": "Logged out"})
 
-# 主页
 @app.route('/')
 @login_required
 def index():
     return render_template('index.html')
 
-# Config API
 @app.route('/api/config', methods=['GET', 'POST'])
 @login_required
 def config():
@@ -531,52 +431,38 @@ def config():
         data = request.json
         monitor.config['config'] = data
         monitor.save_config()
-        # 更新后立即重载配置到监控器
-        monitor.reload()
         return jsonify({"status": "success", "message": "Config updated"})
     else:
         return jsonify(monitor.config.get('config', {}))
 
-# Stocks API
 @app.route('/api/stocks', methods=['GET', 'POST', 'DELETE'])
 @login_required
 def stocks():
     if request.method == 'POST':
         data = request.json
-        stock_name = data['name']
-        url = data['url']
-        if 'stock' not in monitor.config:
-             monitor.config['stock'] = {}
-        monitor.config['stock'][stock_name] = {"url": url, "status": False}
+        name, url = data['name'], data['url']
+        if 'stock' not in monitor.config: monitor.config['stock'] = {}
+        monitor.config['stock'][name] = {"url": url, "status": False}
         monitor.save_config()
-        return jsonify({"status": "success", "message": f"Stock '{stock_name}' added"})
+        return jsonify({"status": "success", "message": f"Stock '{name}' added"})
     elif request.method == 'DELETE':
-        stock_name = request.json['name']
-        if 'stock' in monitor.config and stock_name in monitor.config['stock']:
-            del monitor.config['stock'][stock_name]
+        name = request.json['name']
+        if 'stock' in monitor.config and name in monitor.config['stock']:
+            del monitor.config['stock'][name]
             monitor.save_config()
-            return jsonify({"status": "success", "message": f"Stock '{stock_name}' deleted"})
-        return jsonify({"status": "error", "message": f"Stock '{stock_name}' not found"}), 404
+            return jsonify({"status": "success", "message": f"Stock '{name}' deleted"})
+        return jsonify({"status": "error", "message": "Not found"}), 404
     else:
         stocks = monitor.config.get('stock', {})
-        stock_list = []
-        for name, details in stocks.items():
-            stock_item = {
-                "name": name,
-                "url": details["url"],
-                "status": details.get("status", False)
-            }
-            stock_list.append(stock_item)
+        stock_list = [{"name": k, "url": v["url"], "status": v.get("status", False)} for k,v in stocks.items()]
         return jsonify(stock_list)
 
 if __name__ == '__main__':
-    # 启动后台监控线程
     thread = threading.Thread(target=monitor.start_monitoring)
     thread.daemon = True
     thread.start()
     
     port = int(os.environ.get("MONITOR_PORT", 5000))
-    # 显式开启多线程支持
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
 EOF
 
@@ -592,96 +478,23 @@ EOF
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stock Monitor - 设置</title>
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f4f7f6;
-            color: #333;
-        }
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-            background-color: #ffffff;
-            padding: 25px;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
-        }
-        h1, h2 {
-            color: #2c3e50;
-            border-bottom: 2px solid #e0e0e0;
-            padding-bottom: 10px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: #555;
-        }
-        input[type="text"], input[type="number"], select {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            box-sizing: border-box;
-            font-size: 14px;
-        }
-        button {
-            background-color: #3498db;
-            color: white;
-            padding: 10px 15px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 15px;
-            font-weight: 600;
-            transition: background-color 0.3s ease;
-        }
-        button:hover {
-            background-color: #2980b9;
-        }
-        button.danger {
-            background-color: #e74c3c;
-        }
-        button.danger:hover {
-            background-color: #c0392b;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-        }
-        th, td {
-            border: 1px solid #ddd;
-            padding: 12px;
-            text-align: left;
-            word-break: break-all;
-        }
-        th {
-            background-color: #f9f9f9;
-            font-weight: 700;
-        }
-        .status-true {
-            color: #27ae60;
-            font-weight: bold;
-        }
-        .status-false {
-            color: #e74c3c;
-            font-weight: bold;
-        }
-        .grid-container {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-        }
-        @media (max-width: 768px) {
-            .grid-container {
-                grid-template-columns: 1fr;
-            }
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 20px; background-color: #f4f7f6; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; background-color: #ffffff; padding: 25px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); }
+        h1, h2 { color: #2c3e50; border-bottom: 2px solid #e0e0e0; padding-bottom: 10px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; font-weight: 600; margin-bottom: 8px; color: #555; }
+        input[type="text"], input[type="number"], select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+        button { background-color: #3498db; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-size: 15px; font-weight: 600; transition: background-color 0.3s ease; }
+        button:hover { background-color: #2980b9; }
+        button.danger { background-color: #e74c3c; }
+        button.danger:hover { background-color: #c0392b; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; word-break: break-all; }
+        th { background-color: #f9f9f9; font-weight: 700; }
+        .status-true { color: #27ae60; font-weight: bold; }
+        .status-false { color: #e74c3c; font-weight: bold; }
+        .grid-container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        @media (max-width: 768px) { .grid-container { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
@@ -689,50 +502,53 @@ EOF
 <div class="container">
     <h1>库存监控设置 <button id="logoutButton" style="float: right; font-size: 14px; padding: 8px 12px;" class="danger">退出登录</button></h1>
 
-    <div id="loadingMessage" style="display: none; font-weight: bold; color: #3498db;">正在加载...</div>
-
     <h2>通用配置</h2>
     <form id="configForm">
         <div class="grid-container">
             <div class="form-group">
-                <label for="frequency">检查频率 (秒)</label>
+                <label for="frequency">检查频率 (秒 / 每个商品)</label>
                 <input type="number" id="frequency" name="frequency" required>
             </div>
             <div class="form-group">
-                <label for="notice_type">通知类型</label>
-                <select id="notice_type" name="notice_type">
-                    <option value="pushplus">Pushplus</option>
-                    <option value="telegram">Telegram</option>
-                    <option value="wechat">WeChat (xizhi)</option>
-                    <option value="custom">Custom URL</option>
-                </select>
+                <label for="threads">并发线程数 (1-10)</label>
+                <input type="number" id="threads" name="threads" required placeholder="默认: 3">
             </div>
         </div>
 
         <div class="form-group">
+            <label for="notice_type">通知类型</label>
+            <select id="notice_type" name="notice_type">
+                <option value="pushplus">Pushplus</option>
+                <option value="telegram">Telegram</option>
+                <option value="wechat">WeChat (xizhi)</option>
+                <option value="custom">Custom URL</option>
+            </select>
+        </div>
+
+        <div class="form-group">
             <label for="pushplus_token">Pushplus Token</label>
-            <input type="text" id="pushplus_token" name="pushplus_token" placeholder="当通知类型为 pushplus 时填写">
+            <input type="text" id="pushplus_token" name="pushplus_token">
         </div>
 
         <div class="grid-container">
             <div class.form-group">
                 <label for="telegrambot">Telegram Bot Token</label>
-                <input type="text" id="telegrambot" name="telegrambot" placeholder="当通知类型为 telegram 时填写">
+                <input type="text" id="telegrambot" name="telegrambot">
             </div>
             <div class="form-group">
                 <label for="chat_id">Telegram Chat ID</label>
-                <input type="text" id="chat_id" name="chat_id" placeholder="当通知类型为 telegram 时填写">
+                <input type="text" id="chat_id" name="chat_id">
             </div>
         </div>
 
         <div class="form-group">
             <label for="wechat_key">WeChat Key (xizhi)</label>
-            <input type="text" id="wechat_key" name="wechat_key" placeholder="当通知类型为 wechat 时填写">
+            <input type="text" id="wechat_key" name="wechat_key">
         </div>
 
         <div class="form-group">
             <label for="custom_url">Custom URL</label>
-            <input type="text" id="custom_url" name="custom_url" placeholder="当通知类型为 custom 时填写 (用 {message} 替代消息)">
+            <input type="text" id="custom_url" name="custom_url" placeholder="{message} 会被替换">
         </div>
 
         <button type="submit">保存配置</button>
@@ -745,11 +561,11 @@ EOF
         <div class="grid-container">
             <div class="form-group">
                 <label for="stockName">名称</label>
-                <input type="text" id="stockName" required placeholder="例如: 显卡 3080">
+                <input type="text" id="stockName" required>
             </div>
             <div class="form-group">
                 <label for="stockUrl">URL</label>
-                <input type="text" id="stockUrl" required placeholder="https://...">
+                <input type="text" id="stockUrl" required>
             </div>
         </div>
         <button type="submit">添加商品</button>
@@ -767,104 +583,68 @@ EOF
                 <th>操作</th>
             </tr>
         </thead>
-        <tbody>
-            </tbody>
+        <tbody></tbody>
     </table>
 </div>
 
 <script>
     const API_CONFIG = '/api/config';
     const API_STOCKS = '/api/stocks';
-
-    // 用于保存从后端获取的完整配置
     let currentConfig = {};
 
     document.addEventListener('DOMContentLoaded', () => {
         loadConfig();
         loadStocks();
-
         document.getElementById('configForm').addEventListener('submit', saveConfig);
         document.getElementById('addStockForm').addEventListener('submit', addStock);
-        
-        // 退出登录事件
         document.getElementById('logoutButton').addEventListener('click', logout);
+        setInterval(loadStocks, 10000); 
     });
 
-    // 封装 fetch 请求以处理 401
     async function fetchWithAuth(url, options = {}) {
         const response = await fetch(url, options);
-        
         if (response.status === 401) {
-            alert('您的会话已过期，请重新登录。');
             window.location.href = '/login';
             throw new Error('Unauthorized');
         }
-        
         return response;
     }
 
-    // 退出登录函数
     async function logout() {
-        try {
-            const response = await fetchWithAuth('/api/logout', { method: 'POST' });
-            
-            if (!response.ok) {
-                 const data = await response.json();
-                 throw new Error(data.message || 'Logout failed');
-            }
-            
-            window.location.href = '/login';
-        } catch (error) {
-            console.error('Error logging out:', error);
-            if (error.message !== 'Unauthorized') {
-                 alert('退出失败!');
-            }
-        }
+        await fetchWithAuth('/api/logout', { method: 'POST' });
+        window.location.href = '/login';
     }
-
 
     async function loadConfig() {
         try {
             const response = await fetchWithAuth(API_CONFIG);
             const config = await response.json();
-            
             currentConfig = config; 
-
-            // 填充表单
             document.getElementById('frequency').value = config.frequency || 30;
+            document.getElementById('threads').value = config.threads || 3;
             document.getElementById('notice_type').value = config.notice_type || 'pushplus';
             document.getElementById('pushplus_token').value = config.pushplus_token || '';
             document.getElementById('telegrambot').value = config.telegrambot || '';
             document.getElementById('chat_id').value = config.chat_id || '';
             document.getElementById('wechat_key').value = config.wechat_key || '';
             document.getElementById('custom_url').value = config.custom_url || '';
-
-        } catch (error) {
-            if (error.message !== 'Unauthorized') {
-                console.error('Error loading config:', error);
-                alert('加载配置失败!');
-            }
-        }
+        } catch (e) {}
     }
 
     async function loadStocks() {
         try {
             const response = await fetchWithAuth(API_STOCKS);
             const stocks = await response.json();
-            
             const tableBody = document.querySelector('#stockTable tbody');
             tableBody.innerHTML = ''; 
-
             if (stocks.length === 0) {
                 tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center;">暂无监控商品</td></tr>';
                 return;
             }
-
             stocks.forEach(stock => {
                 const row = tableBody.insertRow();
                 const statusClass = stock.status ? 'status-true' : 'status-false';
                 const statusText = stock.status ? '有货' : '缺货';
-
                 row.innerHTML = `
                     <td>${escapeHTML(stock.name)}</td>
                     <td>${escapeHTML(stock.url)}</td>
@@ -872,19 +652,13 @@ EOF
                     <td><button class="danger" onclick="deleteStock('${escapeHTML(stock.name)}')">删除</button></td>
                 `;
             });
-
-        } catch (error) {
-            if (error.message !== 'Unauthorized') {
-                console.error('Error loading stocks:', error);
-                alert('加载商品列表失败!');
-            }
-        }
+        } catch (e) {}
     }
 
     async function saveConfig(event) {
         event.preventDefault();
-
         currentConfig.frequency = parseInt(document.getElementById('frequency').value, 10);
+        currentConfig.threads = parseInt(document.getElementById('threads').value, 10) || 3;
         currentConfig.notice_type = document.getElementById('notice_type').value;
         currentConfig.pushplus_token = document.getElementById('pushplus_token').value;
         currentConfig.telegrambot = document.getElementById('telegrambot').value;
@@ -892,81 +666,42 @@ EOF
         currentConfig.wechat_key = document.getElementById('wechat_key').value;
         currentConfig.custom_url = document.getElementById('custom_url').value;
         
-        try {
-            await fetchWithAuth(API_CONFIG, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(currentConfig)
-            });
-            
-            alert('配置已保存! 服务将自动重载。');
-            loadConfig(); 
-        } catch (error) {
-             if (error.message !== 'Unauthorized') {
-                console.error('Error saving config:', error);
-                alert('保存配置失败!');
-            }
-        }
+        await fetchWithAuth(API_CONFIG, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(currentConfig)
+        });
+        alert('配置已保存!');
     }
 
     async function addStock(event) {
         event.preventDefault();
         const name = document.getElementById('stockName').value;
         const url = document.getElementById('stockUrl').value;
-
-        if (!name || !url) {
-            alert('名称和 URL 不能为空!');
-            return;
-        }
-
-        try {
-            await fetchWithAuth(API_STOCKS, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, url })
-            });
-
-            alert('商品已添加!');
-            document.getElementById('addStockForm').reset(); 
-            loadStocks(); 
-        } catch (error) {
-             if (error.message !== 'Unauthorized') {
-                console.error('Error adding stock:', error);
-                alert('添加商品失败!');
-            }
-        }
+        if (!name || !url) return;
+        await fetchWithAuth(API_STOCKS, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, url })
+        });
+        alert('商品已添加!');
+        document.getElementById('addStockForm').reset(); 
+        loadStocks(); 
     }
 
     async function deleteStock(name) {
-        if (!confirm(`确定要删除 "${name}" 吗?`)) {
-            return;
-        }
-
-        try {
-            await fetchWithAuth(API_STOCKS, {
-                method: 'DELETE',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: name })
-            });
-
-            alert('商品已删除!');
-            loadStocks(); 
-        } catch (error) {
-             if (error.message !== 'Unauthorized') {
-                console.error('Error deleting stock:', error);
-                alert('删除商品失败!');
-            }
-        }
+        if (!confirm(`确定要删除 "${name}" 吗?`)) return;
+        await fetchWithAuth(API_STOCKS, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name })
+        });
+        loadStocks(); 
     }
 
     function escapeHTML(str) {
-        if (str === null || str === undefined) return '';
-        return str.toString()
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
+        if (!str) return '';
+        return str.toString().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 </script>
 </body>
@@ -1012,35 +747,27 @@ EOF
             <p id="errorMessage"></p>
         </form>
     </div>
-
     <script>
         document.getElementById('loginForm').addEventListener('submit', async (event) => {
             event.preventDefault();
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
             const errorMessage = document.getElementById('errorMessage');
-
             errorMessage.style.display = 'none';
-
             try {
                 const response = await fetch('/api/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username, password })
                 });
-
                 const data = await response.json();
-
                 if (response.ok && data.status === 'success') {
-                    // 登录成功
-                    window.location.href = '/'; // 重定向到主仪表盘
+                    window.location.href = '/'; 
                 } else {
-                    // 登录失败
-                    errorMessage.textContent = data.message || '登录失败，请重试。';
+                    errorMessage.textContent = data.message || '登录失败';
                     errorMessage.style.display = 'block';
                 }
-            } catch (error) {
-                console.error('Error logging in:', error);
+            } catch (e) {
                 errorMessage.textContent = '登录时发生网络错误。';
                 errorMessage.style.display = 'block';
             }
@@ -1084,346 +811,159 @@ EOF
     systemctl enable "$SERVICE_NAME"
     systemctl start "$SERVICE_NAME"
 
-    # -------------------------------------------------
-    # 关键步骤：将此脚本复制为 sm 命令
-    # -------------------------------------------------
     echo -e "${GREEN}安装 'sm' 快捷命令到 ${SM_COMMAND_PATH}...${NC}"
     cp "$0" "$SM_COMMAND_PATH"
     chmod +x "$SM_COMMAND_PATH"
 
     echo -e "${GREEN}================ 安装完成 ==================${NC}"
-    echo -e "服务已安装到: ${INSTALL_DIR}"
     echo -e "Web 界面正在运行于: ${YELLOW}http://<您的IP>:${MONITOR_PORT}${NC}"
     echo -e "您的登录用户名: ${YELLOW}${ADMIN_USER}${NC}"
+    echo -e "您的登录密码:   ${YELLOW}${ADMIN_PASS}${NC}"
     echo -e "配置文件路径: ${YELLOW}${CONFIG_FILE}${NC}"
-    if [ -n "$PROXY_HOST" ]; then
-        echo -e "FlareSolverr 代理位于: ${YELLOW}${PROXY_HOST}${NC}"
-    fi
-    echo -e ""
-    echo -e "您现在可以在系统的任何位置使用 ${GREEN}sm${NC} 命令来管理此服务。"
-    echo -e "${GREEN}请访问上述 URL 并使用您设置的凭据登录。${NC}"
+    echo -e "您现在可以在任何位置使用 ${GREEN}sm${NC} 命令管理服务。"
 }
 
 # 2. 卸载服务
 uninstall_monitor() {
     check_root
+    echo -e "${RED}警告：您即将卸载 Stock Monitor 服务。${NC}"
+    read -p "确定要继续吗？(y/N): " confirm_uninstall
+    if [[ ! "$confirm_uninstall" =~ ^[Yy]$ ]]; then
+        echo -e "${GREEN}已取消卸载。${NC}"
+        return
+    fi
+
     echo -e "${RED}开始卸载 Stock Monitor...${NC}"
 
     if [ -f "$SERVICE_FILE" ]; then
-        echo -e "${RED}停止并禁用 systemd 服务...${NC}"
         systemctl stop "$SERVICE_NAME"
         systemctl disable "$SERVICE_NAME"
         rm "$SERVICE_FILE"
         systemctl daemon-reload
-    else
-        echo -e "${YELLOW}未找到 systemd 服务文件。${NC}"
     fi
 
-    # *** v5.2 新增：询问是否保留配置 ***
     echo -e "${YELLOW}-------------------------------------------${NC}"
     read -p "您是否希望保留用户配置文件 (${DATA_DIR})？ (y/N): " keep_config
-    echo -e "${YELLOW}-------------------------------------------${NC}"
-
     if [[ "$keep_config" =~ ^[Yy]$ ]]; then
-        echo -e "${GREEN}正在保留数据目录: ${DATA_DIR}${NC}"
-        # 删除除 data 目录外的所有内容
         rm -rf "${INSTALL_DIR}/venv"
         rm -f "${INSTALL_DIR}/core.py"
         rm -f "${INSTALL_DIR}/web.py"
         rm -rf "${INSTALL_DIR}/templates"
-        echo -e "${YELLOW}脚本和组件已删除，数据已保留。${NC}"
+        echo -e "${YELLOW}数据已保留。${NC}"
     else
-        echo -e "${YELLOW}未选择保留数据。${NC}"
-        if [ -d "$INSTALL_DIR" ]; then
-            echo -e "${RED}删除安装目录: ${INSTALL_DIR}${NC}"
-            rm -rf "$INSTALL_DIR"
-        else
-            echo -e "${YELLOW}未找到安装目录。${NC}"
-        fi
-    fi
-    # *** 卸载逻辑修改结束 ***
-
-    if [ -f "$SM_COMMAND_PATH" ]; then
-        echo -e "${RED}删除快捷命令: ${SM_COMMAND_PATH}${NC}"
-        rm "$SM_COMMAND_PATH"
-    else
-        echo -e "${YELLOW}未找到快捷命令。${NC}"
+        if [ -d "$INSTALL_DIR" ]; then rm -rf "$INSTALL_DIR"; fi
     fi
 
-    # *** v5.3 新增：卸载时移除 systemd drop-in 配置 ***
+    if [ -f "$SM_COMMAND_PATH" ]; then rm "$SM_COMMAND_PATH"; fi
+
+    # 删除覆盖配置
     local DROP_IN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
-    if [ -d "$DROP_IN_DIR" ]; then
-        echo -e "${RED}删除 systemd 覆盖配置目录: ${DROP_IN_DIR}${NC}"
-        rm -rf "$DROP_IN_DIR"
-        systemctl daemon-reload
-    fi
-    # *** 卸载逻辑修改结束 ***
+    if [ -d "$DROP_IN_DIR" ]; then rm -rf "$DROP_IN_DIR"; systemctl daemon-reload; fi
 
-    echo -e "${YELLOW}注意：此卸载脚本不会删除 Docker 或 FlareSolverr 容器。${NC}"
-    echo -e "${YELLOW}如果您想一并删除 FlareSolverr，请运行:${NC}"
-    echo -e "${YELLOW}docker rm -f flaresolverr${NC}"
-    
     echo -e "${GREEN}卸载完成。${NC}"
 }
 
-# 3. 当前服务状态
+# 3. 状态与日志
 check_status() {
-    echo -e "${GREEN}--- 当前服务状态 (${SERVICE_NAME}) ---${NC}"
+    echo -e "${GREEN}--- 服务状态 ---${NC}"
     systemctl status "$SERVICE_NAME" --no-pager
 }
 
-# 4. 开始服务
-start_service() {
-    echo -e "${GREEN}正在启动服务...${NC}"
-    systemctl start "$SERVICE_NAME"
-    echo -e "${GREEN}启动完成。${NC}"
-    check_status
-}
-
-# 5. 停止服务
-stop_service() {
-    echo -e "${YELLOW}正在停止服务...${NC}"
-    systemctl stop "$SERVICE_NAME"
-    echo -e "${GREEN}停止完成。${NC}"
-    check_status
-}
-
-# 6. 重启服务
-restart_service() {
-    echo -e "${YELLOW}正在重启服务...${NC}"
-    systemctl restart "$SERVICE_NAME"
-    echo -e "${GREEN}重启完成。${NC}"
-    check_status
-}
-
-# 7. 显示实时日志
 show_logs() {
-    echo -e "${GREEN}--- 按 Ctrl+C 退出日志查看 (支持彩色高亮) ---${NC}"
-    
-    # *** v5.7 修复: 使用 printf 强制生成真实的 ESC 字符 ***
+    echo -e "${GREEN}--- 实时日志 (Ctrl+C 退出) ---${NC}"
     local c_red=$(printf '\033[31m')
     local c_green=$(printf '\033[32m')
-    local c_yellow=$(printf '\033[33m')
     local c_reset=$(printf '\033[0m')
-
-    # 使用 --unbuffered 确保日志实时输出
     journalctl -u "$SERVICE_NAME" -f | \
     sed --unbuffered \
     -e "s/缺货/${c_red}缺货${c_reset}/g" \
-    -e "s/out of stock/${c_red}out of stock${c_reset}/Ig" \
     -e "s/有货/${c_green}有货${c_reset}/g" \
-    -e "s/Error/${c_red}Error${c_reset}/g" \
-    -e "s/failed/${c_red}failed${c_reset}/g" \
-    -e "s/Using proxy/${c_yellow}Using proxy${c_reset}/g"
+    -e "s/Error/${c_red}Error${c_reset}/g"
 }
 
-# 8. 显示当前监控项目
-list_stocks() {
-    echo -e "${GREEN}--- 当前监控项目列表 ---${NC}"
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "${RED}错误：配置文件 ${CONFIG_FILE} 未找到。${NC}"
-        return
-    fi
-    
-    # 使用 jq 解析并格式化输出
-    jq -r '.stock | if . == null or . == {} then "  (当前没有监控项目)" else keys[] as $k | "  - \($k)\n    URL: \(.[$k].url)" end' "$CONFIG_FILE"
-    echo -e "${NC}"
-}
+# 4. 服务控制
+start_service() { systemctl start "$SERVICE_NAME"; check_status; }
+stop_service() { systemctl stop "$SERVICE_NAME"; check_status; }
+restart_service() { systemctl restart "$SERVICE_NAME"; check_status; }
 
-# 9. 修改监控列表 (编辑配置文件)
-edit_stocks() {
-    echo -e "${YELLOW}将使用 nano 打开配置文件: ${CONFIG_FILE}${NC}"
-    echo -e "您可以直接修改 'stock' 部分来增删监控项。"
-    echo -e "修改 'config' 部分来更改推送 Token 或频率。"
-    echo -e "${GREEN}服务将在下个监控周期 (最多等待 frequency 秒) 自动加载您的更改。${NC}"
-    echo -e "${GREEN}建议：现在使用网页界面进行配置更方便。${NC}"
-    echo -e "${YELLOW}如需修改 Web UI 登录凭据，请编辑 ${SERVICE_FILE} 文件中的 'ADMIN_USER' 和 'ADMIN_PASS' 环境变量，然后运行 'systemctl daemon-reload' 和 'systemctl restart ${SERVICE_NAME}'。${NC}"
-    echo -e "按任意键继续..."
-    read -n 1
-    
-    if [ -z "$EDITOR" ]; then
-        EDITOR=nano
-    fi
-    
-    $EDITOR "$CONFIG_FILE"
-    
-    echo -e "${GREEN}文件已编辑。${NC}"
-    echo -e "您希望现在重启服务以立即生效吗? (y/N)"
-    read -r -n 1 choice
-    echo ""
-    if [[ "$choice" =~ ^[Yy]$ ]]; then
-        restart_service
-    fi
-}
-
-# =================================================================
-# v5.4 修改：设置自动重启 (交互式)
-# =================================================================
+# 5. 自动重启设置
 setup_auto_restart() {
     check_root
+    local OVERRIDE_FILE="/etc/systemd/system/${SERVICE_NAME}.service.d/auto-restart.conf"
+    mkdir -p "$(dirname "$OVERRIDE_FILE")"
     
-    local DROP_IN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
-    local OVERRIDE_FILE="${DROP_IN_DIR}/auto-restart.conf"
-
-    clear
-    echo -e "${GREEN}--- 设置服务自动重启 ---${NC}"
-    echo -e "此功能使用 systemd 的 'RuntimeMaxSec' 属性。"
-    echo -e "服务将在(累积)运行指定时间后自动重启。"
-    echo -e "${YELLOW}这有助于在不确定的情况下防止潜在的内存泄漏。${NC}\n"
-
-    # v5.4 新增：检查并显示当前设置
-    local current_setting="未设置"
-    if [ -f "$OVERRIDE_FILE" ]; then
-        # 从配置文件中提取 RuntimeMaxSec 的值
-        current_setting=$(grep "RuntimeMaxSec" "$OVERRIDE_FILE" | cut -d'=' -f2)
-        if [ -z "$current_setting" ]; then
-            current_setting="配置错误 (文件存在但值为空)"
-        fi
-    fi
-    echo -e "当前设置: ${YELLOW}${current_setting}${NC}\n"
+    echo -e "${GREEN} 1. 设置定时重启 (小时)${NC}"
+    echo -e "${YELLOW} 2. 禁用自动重启${NC}"
+    read -p "选择: " choice
     
-    echo -e " 1. ${GREEN}设置自定义重启时间 (单位: 小时)${NC}"
-    echo -e " 2. ${YELLOW}禁用自动重启功能${NC}"
-    echo -e " 0. ${GREEN}返回主菜单${NC}"
-    read -p "请选择 [0-2]: " restart_choice
-
-    case $restart_choice in
-        1)
-            read -p "请输入您希望的重启间隔 (单位: 小时, 必须为正整数, 例如: 8): " custom_hours
-            
-            # 验证输入是否为大于0的整数
-            if ! [[ "$custom_hours" =~ ^[1-9][0-9]*$ ]]; then
-                echo -e "${RED}错误：输入无效。请输入一个大于0的整数。${NC}"
-                return
-            fi
-
-            echo -e "${GREEN}正在设置每 ${custom_hours} 小时重启...${NC}"
-            mkdir -p "$DROP_IN_DIR"
-            cat << EOF > "$OVERRIDE_FILE"
+    if [ "$choice" == "1" ]; then
+        read -p "重启间隔(小时): " hours
+        cat << EOF > "$OVERRIDE_FILE"
 [Service]
-# This file is managed by the 'sm' script (option 10)
-RuntimeMaxSec=${custom_hours}h
-Restart=always
+RuntimeMaxSec=${hours}h
 EOF
-            echo -e "${GREEN}设置成功！${NC}"
-            ;;
-        2)
-            echo -e "${YELLOW}正在禁用自动重启...${NC}"
-            if [ -f "$OVERRIDE_FILE" ]; then
-                rm -f "$OVERRIDE_FILE"
-                # 尝试删除空目录，> /dev/null 2>&1 忽略错误
-                rmdir "$DROP_IN_DIR" > /dev/null 2>&1
-                echo -e "${GREEN}已禁用。${NC}"
-            else
-                echo -e "${YELLOW}自动重启功能尚未启用，无需操作。${NC}"
-                return # 无需重载
-            fi
-            ;;
-        0)
-            echo -e "${GREEN}已取消。${NC}"
-            return
-            ;;
-        *)
-            echo -e "${RED}无效选项。${NC}"
-            return
-            ;;
-    esac
-    
-    echo -e "${GREEN}正在重载 systemd 配置...${NC}"
+        echo -e "${GREEN}已设置。${NC}"
+    elif [ "$choice" == "2" ]; then
+        rm -f "$OVERRIDE_FILE"
+        echo -e "${GREEN}已禁用。${NC}"
+    fi
     systemctl daemon-reload
-    echo -e "${GREEN}正在重启 ${SERVICE_NAME} 以应用新设置...${NC}"
     systemctl restart "$SERVICE_NAME"
-    echo -e "${GREEN}操作完成。${NC}"
 }
 
-
 # =================================================================
-# 菜单显示
+# 菜单逻辑
 # =================================================================
 
-# 显示完整管理菜单
-show_management_menu() {
+show_menu() {
     clear
+    # 获取服务状态并带上颜色
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        STATUS_MSG="${GREEN}● 运行中 (Active)${NC}"
+    else
+        STATUS_MSG="${RED}● 未运行 (Stopped)${NC}"
+    fi
+
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 管理菜单 (sm) - v5.9${NC}"
+    echo -e "${GREEN}   Stock Monitor 管理菜单 (v6.6)${NC}"
     echo -e "${GREEN}===========================================${NC}"
-    echo -e " 1. ${GREEN}安装/升级服务 (自动 Docker/FlareSolverr)${NC}"
-    echo -e " 2. ${RED}卸载服务${NC}"
-    echo -e " 3. ${GREEN}当前服务状态${NC}"
-    echo -e " 4. ${GREEN}开始服务${NC}"
-    echo -e " 5. ${YELLOW}停止服务${NC}"
-    echo -e " 6. ${YELLOW}重启服务${NC}"
-    echo -e " 7. ${GREEN}显示服务实时日志 (彩色)${NC}"
-    echo -e " 8. ${GREEN}显示当前监控项目列表${NC}"
-    echo -e " 9. ${YELLOW}修改配置 (nano - 专家模式)${NC}"
-    echo -e " 10. ${GREEN}设置自动重启 (自定义/禁用)${NC}"
-    echo -e " 0. ${GREEN}退出脚本${NC}"
+    echo -e " 服务状态: ${STATUS_MSG}"
     echo -e "${GREEN}-------------------------------------------${NC}"
-    echo -e "${GREEN}推荐使用网页界面管理配置。${NC}"
-    read -p "请输入您的选择 [0-10]: " choice
+    echo -e "${GREEN} 1. 安装/升级服务${NC}"
+    echo -e "${GREEN} 2. 卸载服务${NC}"
+    echo -e "${GREEN} 3. 服务状态${NC}"
+    echo -e "${GREEN} 4. 启动服务${NC}"
+    echo -e "${GREEN} 5. 停止服务${NC}"
+    echo -e "${GREEN} 6. 重启服务${NC}"
+    echo -e "${GREEN} 7. 实时日志${NC}"
+    echo -e "${GREEN} 8. 设置自动重启${NC}"
+    echo -e "${GREEN} 0. 退出${NC}"
+    echo -e "${GREEN}-------------------------------------------${NC}"
+    read -p "请输入您的选择 [0-8]: " choice
     
     case $choice in
         1) install_monitor ;;
         2) uninstall_monitor ;;
         3) check_status ;;
-        4. | 4) start_service ;;
-        5. | 5) stop_service ;;
-        6. | 6) restart_service ;;
-        7. | 7) show_logs ;;
-        8. | 8) list_stocks ;;
-        9. | 9) edit_stocks ;;
-        10) setup_auto_restart ;;
+        4) start_service ;;
+        5) stop_service ;;
+        6) restart_service ;;
+        7) show_logs ;;
+        8) setup_auto_restart ;;
         0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请输入 0-10。${NC}" ;;
+        *) echo "无效选项" ;;
     esac
-    
-    echo -e "\n按任意键返回菜单..."
-    read -n 1
-    show_management_menu
+    read -p "按任意键返回菜单..."
+    show_menu
 }
 
-# 显示仅安装菜单
-show_install_menu() {
-    clear
-    echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 安装程序 (v5.9)${NC}"
-    echo -e "${GREEN}===========================================${NC}"
-    echo -e "${YELLOW}服务尚未安装。${NC}\n"
-    echo -e " 1. ${GREEN}安装 Stock Monitor (自动 Docker/FlareSolverr)${NC}"
-    echo -e " 0. ${GREEN}退出脚本${NC}"
-    echo -e "${GREEN}-------------------------------------------${NC}"
-    read -p "请输入您的选择 [0-1]: " choice
-    
-    case $choice in
-        1) install_monitor ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效选项，请输入 0 或 1。${NC}" ;;
-    esac
-}
+if [ "$1" == "install" ]; then check_root; install_monitor; exit 0; fi
+if [ "$1" == "uninstall" ]; then check_root; uninstall_monitor; exit 0; fi
 
-# =================================================================
-# 脚本主入口
-# =================================================================
-
-# 检查是否传入了特定参数 (用于首次安装)
-if [ "$1" == "install" ]; then
-    check_root
-    install_monitor
-    exit 0
-fi
-
-if [ "$1" == "uninstall" ]; then
-    check_root
-    uninstall_monitor
-    exit 0
-fi
-
-# 如果没有参数，则显示菜单
 check_root
-if is_installed; then
-    show_management_menu
-else
-    show_install_menu
+if is_installed; then show_menu; else
+    echo -e "${YELLOW}服务尚未安装。${NC}"
+    echo -e "输入 1 安装，输入 0 退出。"
+    read -p "选择: " c
+    if [ "$c" == "1" ]; then install_monitor; else exit 0; fi
 fi
-
-exit 0
