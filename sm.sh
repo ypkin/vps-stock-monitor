@@ -3,7 +3,7 @@
 # =================================================================
 # Stock Monitor (Pushplus 版) 多功能管理脚本
 # 快捷命令: sm
-# (v6.7 - 代码结构模块化优化，功能保持一致)
+# (v6.8 - 增加检测过程详细日志)
 # =================================================================
 
 # --- 颜色定义 ---
@@ -44,7 +44,7 @@ is_installed() {
 # --- 文件生成函数 (模块化) ---
 
 generate_core_py() {
-    echo -e "${GREEN}生成核心逻辑 (core.py)...${NC}"
+    echo -e "${GREEN}生成核心逻辑 (core.py) - 已增强日志...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/core.py"
 import json
 import time
@@ -136,6 +136,7 @@ class StockMonitor:
             headers = {"Content-Type": "application/json"}
             data = {"cmd": "request.get", "url": url, "maxTimeout": 120000}
             try:
+                print(f"    -> 尝试使用 FlareSolverr 代理...", flush=True)
                 response = requests.post(f'{self.proxy_host}/v1', headers=headers, json=data)
                 resp_json = response.json()
                 if resp_json.get('status') == 'ok' and 'solution' in resp_json:
@@ -145,6 +146,7 @@ class StockMonitor:
                 return self._mock_failed_response(503, str(e))
 
         try:
+            print(f"    -> 正在请求: {url}", flush=True)
             content = None
             use_proxy = False
             if self.proxy_host:
@@ -155,7 +157,9 @@ class StockMonitor:
             
             if not self.proxy_host:
                 response = requests.get(url, headers=self.headers, timeout=30)
-                if response.status_code == 403: return None
+                if response.status_code == 403: 
+                    print(f"    -> 直接请求返回 403 禁止访问", flush=True)
+                    return None
                 content = response.content
             elif use_proxy:
                 response, content = fetch_flaresolverr(url)
@@ -165,27 +169,44 @@ class StockMonitor:
             else:
                 response = requests.get(url, headers=self.headers, timeout=30)
                 if response.status_code == 403:
+                    print(f"    -> 直接请求 403，切换 FlareSolverr...", flush=True)
                     response, content = fetch_flaresolverr(url)
                     if response.status_code == 200:
                         with self.lock: self.blocked_urls.add(url)
                 content = response.content
             
-            if not response or response.status_code != 200: return None
+            if not response:
+                print(f"    -> 请求无响应", flush=True)
+                return None
+                
+            print(f"    -> 响应状态: {response.status_code}, 内容大小: {len(content) if content else 0} bytes", flush=True)
+            
+            if response.status_code != 200: return None
+
+            if '宝塔防火墙' in str(content): 
+                print(f"    -> 检测到宝塔防火墙拦截", flush=True)
+                return None
 
             soup = BeautifulSoup(content, 'html.parser')
-            if '宝塔防火墙' in str(content): return None
-
+            
+            # 检测 CSS Class
             out_of_stock = soup.find('div', class_=alert_class)
-            if out_of_stock: return False
+            if out_of_stock: 
+                print(f"    -> 发现缺货 CSS 标签 (class: {alert_class})", flush=True)
+                return False
 
+            # 检测关键字
             out_of_stock_keywords = ['out of stock', '缺货', 'sold out', 'no stock', '缺貨中']
             page_text = soup.get_text().lower()
             for keyword in out_of_stock_keywords:
-                if keyword in page_text: return False
+                if keyword in page_text: 
+                    print(f"    -> 发现缺货关键字: '{keyword}'", flush=True)
+                    return False
 
+            print(f"    -> 未发现缺货标识，判定为 [有货]", flush=True)
             return True
         except Exception as e:
-            print(f"Error fetching {url}: {e}", flush=True)
+            print(f"    -> 请求/解析异常: {e}", flush=True)
             return None
 
     def send_message(self, message):
@@ -207,6 +228,8 @@ class StockMonitor:
     def process_single_stock(self, name, item):
         url = item['url']
         last_status = item.get('status', False)
+        
+        print(f"[{name}] 开始检测流程...", flush=True)
         current_status = self.check_stock(url)
         
         with self.lock:
@@ -704,7 +727,7 @@ EOF
 
 install_monitor() {
     check_root
-    echo -e "${GREEN}1. 开始安装 Stock Monitor (v6.7)...${NC}"
+    echo -e "${GREEN}1. 开始安装 Stock Monitor (v6.8)...${NC}"
 
     # 检查卸载
     if is_installed; then
@@ -902,7 +925,7 @@ show_menu() {
     fi
 
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 管理菜单 (v6.7)${NC}"
+    echo -e "${GREEN}   Stock Monitor 管理菜单 (v6.8)${NC}"
     echo -e "${GREEN}===========================================${NC}"
     echo -e " 服务状态: ${STATUS_MSG}"
     echo -e "${GREEN}-------------------------------------------${NC}"
