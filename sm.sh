@@ -3,10 +3,10 @@
 # =================================================================
 # Stock Monitor (Pushplus 版) 多功能管理脚本
 # 快捷命令: sm
-# (v5.4 - 自动重启时间改为交互式设置)
+# (v5.9 - 逻辑优化、拼写修复、依赖安装防卡死)
 # =================================================================
 
-# 定义颜色
+# 定义脚本自身输出颜色
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
@@ -46,7 +46,7 @@ is_installed() {
 # 1. 安装服务
 install_monitor() {
     check_root
-    echo -e "${GREEN}1. 开始安装 Stock Monitor (v5.4)...${NC}"
+    echo -e "${GREEN}1. 开始安装 Stock Monitor (v5.9)...${NC}"
 
     if is_installed; then
         echo -e "${YELLOW}警告：检测到已安装的服务。将首先执行卸载...${NC}"
@@ -54,10 +54,12 @@ install_monitor() {
     fi
 
     echo -e "${GREEN}更新软件包列表并安装依赖 (python, pip, venv, curl, jq)...${NC}"
+    # 优化：使用非交互模式防止 apt 卡住
+    export DEBIAN_FRONTEND=noninteractive
     apt update
     apt install -y python3 python3-pip python3-venv curl jq
     if [ $? -ne 0 ]; then
-        echo -e "${RED}依赖安装失败，请检查 apt。${NC}"
+        echo -e "${RED}依赖安装失败，请检查 apt 源或网络连接。${NC}"
         exit 1
     fi
 
@@ -156,9 +158,9 @@ install_monitor() {
     deactivate
 
     # -------------------------------------------------
-    # 写入 core.py (v5 优化版)
+    # 写入 core.py (v5.9 修复 Typo，优化结构)
     # -------------------------------------------------
-    echo -e "${GREEN}写入 core.py (v5 优化版)...${NC}"
+    echo -e "${GREEN}写入 core.py (v5.9)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/core.py"
 import json
 import time
@@ -173,8 +175,25 @@ class StockMonitor:
         self.config_path = config_path
         self.blocked_urls = set()  # 存储已经代理过的URL
         self.proxy_host = os.getenv("PROXY_HOST", None)  # 从环境变量读取
+        
+        # 优化：预定义 Headers，避免每次请求重复创建
+        self.headers = {
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+            'cache-control': 'max-age=0',
+            'priority': 'u=0, i',
+            'sec-ch-ua': '"Chromium";v="130", "Microsoft Edge";v="130", "Not?A_Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'cross-site',
+            'sec-fetch-user': '?1',
+            'upgrade-insecure-requests': '1',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+        }
+        
         self.load_config()
-
 
     # 加载配置文件
     def load_config(self):
@@ -187,18 +206,22 @@ class StockMonitor:
             
         try:
             with open(self.config_path, 'r') as f:
-                self.config = json.load(f)
+                content = f.read().strip()
+                if not content: # 检查文件是否为空
+                    raise ValueError("Empty configuration file")
+                self.config = json.loads(content)
             self.frequency = int(self.config['config'].get('frequency', 300))
             print("配置已加载", flush=True) 
-        except json.JSONDecodeError:
-            print(f"配置文件 {self.config_path} 格式错误，请检查。正在使用默认配置。", flush=True)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"配置文件 {self.config_path} 格式错误或为空 ({e})。正在重建默认配置。", flush=True)
             self.create_initial_config() 
+            # 递归调用尝试重新加载
             self.load_config()
         except Exception as e:
             print(f"加载配置时出错: {e}", flush=True)
-            self.create_initial_config()
-            self.load_config()
-
+            # 发生未知错误时，避免死循环，使用内存默认值
+            self.config = {"config": {"frequency": 30}, "stock": {}}
+            self.frequency = 30
 
     # 创建初始的配置文件
     def create_initial_config(self):
@@ -224,7 +247,6 @@ class StockMonitor:
             json.dump(self.config, f, indent=4)
         print("配置已更新", flush=True)
 
-    # *** v5 关键更新 ***
     # 封装一个模拟的 Response 对象，用于在代理失败时返回
     def _mock_failed_response(self, status_code, content):
         class MockResponse:
@@ -235,24 +257,7 @@ class StockMonitor:
 
     # 检查商品库存状态
     def check_stock(self, url, alert_class="alert alert-danger error-heading"):
-
-        headers = {
-            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-            'cache-control': 'max-age=0',
-            'priority': 'u=0, i',
-            'sec-ch-ua': '"Chromium";v="130", "Microsoft Edge";v="130", "Not?A_Brand";v="99"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'cross-site',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
-        }
-
-        # *** v5 关键更新：超时延长 & 健壮性检查 ***
+        # 内部函数：处理 FlareSolverr 代理请求
         def fetch_flaresolverr(url):
             print(f"Using proxy for {url}", flush=True)
             headers = {"Content-Type": "application/json"}
@@ -279,14 +284,14 @@ class StockMonitor:
                 print(f"FlareSolverr connection error: {e}", flush=True)
                 return self._mock_failed_response(503, f"FlareSolverr connection error: {e}")
             except Exception as e:
-                # 捕获其他所有异常 (例如 json 解码失败, 'solution' KeyError 等)
+                # 捕获其他所有异常
                 print(f"FlareSolverr general error: {e}", flush=True)
                 return self._mock_failed_response(500, f"FlareSolverr general error: {e}")
 
 
         try:
             if not self.proxy_host:
-                response = requests.get(url, headers=headers)
+                response = requests.get(url, headers=self.headers)
                 print(response.status_code, flush=True)
                 if response.status_code == 403:
                     print(f"Error fetching {url}: Status code {response.status_code}. Try to set host.", flush=True)
@@ -301,7 +306,7 @@ class StockMonitor:
                         self.blocked_urls.remove(url)
                             
                 else:
-                    response = requests.get(url, headers=headers)
+                    response = requests.get(url, headers=self.headers)
                     if response.status_code == 403:
                         print(f'Return  {response.status_code}', flush=True)
                         response, content = fetch_flaresolverr(url)
@@ -309,7 +314,6 @@ class StockMonitor:
                             self.blocked_urls.add(url)
                     content = response.content
                 
-                # *** v5 更新：检查来自 fetch_flaresolverr 的模拟响应 ***
                 if response.status_code != 200:
                     print(f"Error fetching {url} via proxy. Status code {response.status_code}", flush=True)
                     return None
@@ -372,7 +376,8 @@ class StockMonitor:
         elif notice_type == 'wechat':
             wechat_key = self.config['config'].get('wechat_key')
             if wechat_key:
-                url = f"httpsas://xizhi.qqoq.net/{wechat_key}.send"
+                # 修复 v5.8 及之前的 URL 拼写错误 (httpsas -> https)
+                url = f"https://xizhi.qqoq.net/{wechat_key}.send"
                 payload = {'title': '库存变更通知', 'content': message}
                 try:
                     response = requests.get(url, params=payload)
@@ -418,7 +423,9 @@ class StockMonitor:
                 self.send_message(message)
                 self.config['stock'][name]['status'] = current_status
                 has_change = True
-            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {name}: {'有货' if current_status else '缺货'}", flush=True)
+            
+            # 仅打印状态，时间戳由 systemd 负责
+            print(f"{name}: {'有货' if current_status else '缺货'}", flush=True)
 
         if has_change:
             self.save_config()
@@ -427,7 +434,7 @@ class StockMonitor:
     def start_monitoring(self):
         print("开始库存监控...", flush=True)
         while True:
-            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 检测库存", flush=True)
+            print("检测库存", flush=True)
             try: 
                 self.load_config()
                 self.update_stock_status()
@@ -446,33 +453,31 @@ if __name__ == "__main__":
 EOF
 
     # -------------------------------------------------
-    # 写入 web.py (v5.1 登录验证)
+    # 写入 web.py
     # -------------------------------------------------
-    echo -e "${GREEN}写入 web.py (v5.1 登录验证)...${NC}"
+    echo -e "${GREEN}写入 web.py (v5.9)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/web.py"
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from core import StockMonitor
 import json
 import threading
 import os
-from functools import wraps # 导入 wraps
+from functools import wraps
 
 app = Flask(__name__)
-# *** 新增：为 session 设置一个 secret key ***
-# 警告：在生产环境中应使用更复杂的随机密钥
+# 警告：在生产环境中建议使用固定的 Secret Key
 app.secret_key = os.urandom(24) 
 monitor = StockMonitor()
 
-# *** 新增：从环境变量读取凭据 ***
+# 从环境变量读取凭据
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "password")
 
-
-# 避免冲突
+# 避免与 Vue/Angular 等前端框架冲突 (虽然这里只用 Jinja2)
 app.jinja_env.variable_start_string = '<<'
 app.jinja_env.variable_end_string = '>>'
 
-# *** 新增：登录装饰器 ***
+# 登录装饰器
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -485,15 +490,14 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# *** 新增：登录页面路由 ***
+# 登录页面路由
 @app.route('/login')
 def login():
-    # 如果已经登录，直接重定向到主页
     if 'logged_in' in session:
         return redirect(url_for('index'))
     return render_template('login.html')
 
-# *** 新增：登录 API 路由 ***
+# 登录 API 路由
 @app.route('/api/login', methods=['POST'])
 def api_login():
     data = request.json
@@ -506,21 +510,20 @@ def api_login():
     else:
         return jsonify({"status": "error", "message": "Invalid credentials"}), 403
 
-# *** 新增：登出 API 路由 ***
+# 登出 API 路由
 @app.route('/api/logout', methods=['POST'])
 @login_required
 def api_logout():
     session.pop('logged_in', None)
     return jsonify({"status": "success", "message": "Logged out"})
 
-
-# *** 修改：保护主页 ***
+# 主页
 @app.route('/')
 @login_required
 def index():
     return render_template('index.html')
 
-# *** 修改：保护 config API ***
+# Config API
 @app.route('/api/config', methods=['GET', 'POST'])
 @login_required
 def config():
@@ -534,7 +537,7 @@ def config():
     else:
         return jsonify(monitor.config.get('config', {}))
 
-# *** 修改：保护 stocks API ***
+# Stocks API
 @app.route('/api/stocks', methods=['GET', 'POST', 'DELETE'])
 @login_required
 def stocks():
@@ -561,22 +564,24 @@ def stocks():
             stock_item = {
                 "name": name,
                 "url": details["url"],
-                "status": details.get("status", False) # 增加默认值
+                "status": details.get("status", False)
             }
             stock_list.append(stock_item)
         return jsonify(stock_list)
 
 if __name__ == '__main__':
+    # 启动后台监控线程
     thread = threading.Thread(target=monitor.start_monitoring)
     thread.daemon = True
     thread.start()
     
     port = int(os.environ.get("MONITOR_PORT", 5000))
-    app.run(debug=False, host='0.0.0.0', port=port)
+    # 显式开启多线程支持
+    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
 EOF
 
     # -------------------------------------------------
-    # 写入 templates/index.html (v5.1 登出和 401 处理)
+    # 写入 templates/index.html
     # -------------------------------------------------
     echo -e "${GREEN}写入 Web UI (index.html)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/templates/index.html"
@@ -781,28 +786,26 @@ EOF
         document.getElementById('configForm').addEventListener('submit', saveConfig);
         document.getElementById('addStockForm').addEventListener('submit', addStock);
         
-        // *** 新增：退出登录事件 ***
+        // 退出登录事件
         document.getElementById('logoutButton').addEventListener('click', logout);
     });
 
-    // *** 新增：封装 fetch 请求以处理 401 ***
+    // 封装 fetch 请求以处理 401
     async function fetchWithAuth(url, options = {}) {
         const response = await fetch(url, options);
         
         if (response.status === 401) {
-            // 401 Unauthorized
             alert('您的会话已过期，请重新登录。');
-            window.location.href = '/login'; // 重定向到登录页
-            throw new Error('Unauthorized'); // 停止后续执行
+            window.location.href = '/login';
+            throw new Error('Unauthorized');
         }
         
         return response;
     }
 
-    // *** 新增：退出登录函数 ***
+    // 退出登录函数
     async function logout() {
         try {
-            // 使用 POST
             const response = await fetchWithAuth('/api/logout', { method: 'POST' });
             
             if (!response.ok) {
@@ -810,10 +813,10 @@ EOF
                  throw new Error(data.message || 'Logout failed');
             }
             
-            window.location.href = '/login'; // 成功退出后重定向
+            window.location.href = '/login';
         } catch (error) {
             console.error('Error logging out:', error);
-            if (error.message !== 'Unauthorized') { // 避免 401 弹窗两次
+            if (error.message !== 'Unauthorized') {
                  alert('退出失败!');
             }
         }
@@ -822,12 +825,9 @@ EOF
 
     async function loadConfig() {
         try {
-            // *** 修改：使用带认证的 fetch ***
             const response = await fetchWithAuth(API_CONFIG);
-            // if (!response.ok) throw new Error('Network response was not ok'); // 已在 fetchWithAuth 中处理
             const config = await response.json();
             
-            // 保存到全局变量，以便保存时使用
             currentConfig = config; 
 
             // 填充表单
@@ -849,13 +849,11 @@ EOF
 
     async function loadStocks() {
         try {
-            // *** 修改：使用带认证的 fetch ***
             const response = await fetchWithAuth(API_STOCKS);
-            // if (!response.ok) throw new Error('Network response was not ok');
             const stocks = await response.json();
             
             const tableBody = document.querySelector('#stockTable tbody');
-            tableBody.innerHTML = ''; // 清空现有列表
+            tableBody.innerHTML = ''; 
 
             if (stocks.length === 0) {
                 tableBody.innerHTML = '<tr><td colspan="4" style="text-align: center;">暂无监控商品</td></tr>';
@@ -886,7 +884,6 @@ EOF
     async function saveConfig(event) {
         event.preventDefault();
 
-        // 从表单读取值并更新全局 config 对象
         currentConfig.frequency = parseInt(document.getElementById('frequency').value, 10);
         currentConfig.notice_type = document.getElementById('notice_type').value;
         currentConfig.pushplus_token = document.getElementById('pushplus_token').value;
@@ -896,17 +893,14 @@ EOF
         currentConfig.custom_url = document.getElementById('custom_url').value;
         
         try {
-            // *** 修改：使用带认证的 fetch ***
-            const response = await fetchWithAuth(API_CONFIG, {
+            await fetchWithAuth(API_CONFIG, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(currentConfig) // 发送更新后的完整配置
+                body: JSON.stringify(currentConfig)
             });
-
-            // if (!response.ok) throw new Error('Network response was not ok');
             
             alert('配置已保存! 服务将自动重载。');
-            loadConfig(); // 重新加载以确认
+            loadConfig(); 
         } catch (error) {
              if (error.message !== 'Unauthorized') {
                 console.error('Error saving config:', error);
@@ -926,18 +920,15 @@ EOF
         }
 
         try {
-            // *** 修改：使用带认证的 fetch ***
-            const response = await fetchWithAuth(API_STOCKS, {
+            await fetchWithAuth(API_STOCKS, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name, url })
             });
 
-            // if (!response.ok) throw new Error('Network response was not ok');
-
             alert('商品已添加!');
-            document.getElementById('addStockForm').reset(); // 重置表单
-            loadStocks(); // 重新加载列表
+            document.getElementById('addStockForm').reset(); 
+            loadStocks(); 
         } catch (error) {
              if (error.message !== 'Unauthorized') {
                 console.error('Error adding stock:', error);
@@ -952,17 +943,14 @@ EOF
         }
 
         try {
-            // *** 修改：使用带认证的 fetch ***
-            const response = await fetchWithAuth(API_STOCKS, {
+            await fetchWithAuth(API_STOCKS, {
                 method: 'DELETE',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name: name })
             });
 
-            // if (!response.ok) throw new Error('Network response was not ok');
-
             alert('商品已删除!');
-            loadStocks(); // 重新加载列表
+            loadStocks(); 
         } catch (error) {
              if (error.message !== 'Unauthorized') {
                 console.error('Error deleting stock:', error);
@@ -971,7 +959,6 @@ EOF
         }
     }
 
-    // 辅助函数，防止 XSS
     function escapeHTML(str) {
         if (str === null || str === undefined) return '';
         return str.toString()
@@ -987,7 +974,7 @@ EOF
 EOF
 
     # -------------------------------------------------
-    # 写入 templates/login.html (v5.1)
+    # 写入 templates/login.html
     # -------------------------------------------------
     echo -e "${GREEN}写入 Web UI (login.html)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/templates/login.html"
@@ -1065,7 +1052,7 @@ EOF
 
 
     # -------------------------------------------------
-    # 写入 systemd 服务文件 (v5.1 增加环境变量)
+    # 写入 systemd 服务文件
     # -------------------------------------------------
     echo -e "${GREEN}创建 systemd 服务: ${SERVICE_NAME}.service${NC}"
     
@@ -1211,8 +1198,23 @@ restart_service() {
 
 # 7. 显示实时日志
 show_logs() {
-    echo -e "${GREEN}--- 按 Ctrl+C 退出日志查看 ---${NC}"
-    journalctl -u "$SERVICE_NAME" -f
+    echo -e "${GREEN}--- 按 Ctrl+C 退出日志查看 (支持彩色高亮) ---${NC}"
+    
+    # *** v5.7 修复: 使用 printf 强制生成真实的 ESC 字符 ***
+    local c_red=$(printf '\033[31m')
+    local c_green=$(printf '\033[32m')
+    local c_yellow=$(printf '\033[33m')
+    local c_reset=$(printf '\033[0m')
+
+    # 使用 --unbuffered 确保日志实时输出
+    journalctl -u "$SERVICE_NAME" -f | \
+    sed --unbuffered \
+    -e "s/缺货/${c_red}缺货${c_reset}/g" \
+    -e "s/out of stock/${c_red}out of stock${c_reset}/Ig" \
+    -e "s/有货/${c_green}有货${c_reset}/g" \
+    -e "s/Error/${c_red}Error${c_reset}/g" \
+    -e "s/failed/${c_red}failed${c_reset}/g" \
+    -e "s/Using proxy/${c_yellow}Using proxy${c_reset}/g"
 }
 
 # 8. 显示当前监控项目
@@ -1343,7 +1345,7 @@ EOF
 show_management_menu() {
     clear
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 管理菜单 (sm) - v5.4${NC}" # <-- v5.4
+    echo -e "${GREEN}   Stock Monitor 管理菜单 (sm) - v5.9${NC}"
     echo -e "${GREEN}===========================================${NC}"
     echo -e " 1. ${GREEN}安装/升级服务 (自动 Docker/FlareSolverr)${NC}"
     echo -e " 2. ${RED}卸载服务${NC}"
@@ -1351,10 +1353,10 @@ show_management_menu() {
     echo -e " 4. ${GREEN}开始服务${NC}"
     echo -e " 5. ${YELLOW}停止服务${NC}"
     echo -e " 6. ${YELLOW}重启服务${NC}"
-    echo -e " 7. ${GREEN}显示服务实时日志${NC}"
+    echo -e " 7. ${GREEN}显示服务实时日志 (彩色)${NC}"
     echo -e " 8. ${GREEN}显示当前监控项目列表${NC}"
     echo -e " 9. ${YELLOW}修改配置 (nano - 专家模式)${NC}"
-    echo -e " 10. ${GREEN}设置自动重启 (自定义/禁用)${NC}" # <-- v5.4 修改
+    echo -e " 10. ${GREEN}设置自动重启 (自定义/禁用)${NC}"
     echo -e " 0. ${GREEN}退出脚本${NC}"
     echo -e "${GREEN}-------------------------------------------${NC}"
     echo -e "${GREEN}推荐使用网页界面管理配置。${NC}"
@@ -1384,7 +1386,7 @@ show_management_menu() {
 show_install_menu() {
     clear
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 安装程序 (v5.4)${NC}" # <-- v5.4
+    echo -e "${GREEN}   Stock Monitor 安装程序 (v5.9)${NC}"
     echo -e "${GREEN}===========================================${NC}"
     echo -e "${YELLOW}服务尚未安装。${NC}\n"
     echo -e " 1. ${GREEN}安装 Stock Monitor (自动 Docker/FlareSolverr)${NC}"
