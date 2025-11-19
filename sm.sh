@@ -3,16 +3,16 @@
 # =================================================================
 # Stock Monitor (Pushplus 版) 多功能管理脚本
 # 快捷命令: sm
-# (v6.6 - 安装结束显示账号密码、状态栏、多线程调度)
+# (v6.7 - 代码结构模块化优化，功能保持一致)
 # =================================================================
 
-# 定义脚本自身输出颜色
+# --- 颜色定义 ---
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
-# 定义常量
+# --- 常量定义 ---
 INSTALL_DIR="/opt/stock-monitor"
 SERVICE_NAME="stock-monitor"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -21,7 +21,9 @@ DATA_DIR="${INSTALL_DIR}/data"
 CONFIG_FILE="${DATA_DIR}/config.json"
 SM_COMMAND_PATH="/usr/local/bin/sm"
 
-# 检查是否为 root 用户
+# --- 基础辅助函数 ---
+
+# 检查 Root 权限
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo -e "${RED}错误：此脚本的大部分操作都需要 root 权限。${NC}"
@@ -33,119 +35,16 @@ check_root() {
 # 检查服务是否已安装
 is_installed() {
     if [ -f "$SERVICE_FILE" ]; then
-        return 0 # 0 表示 "true" (已安装)
+        return 0 # true
     else
-        return 1 # 1 表示 "false" (未安装)
+        return 1 # false
     fi
 }
 
-# =================================================================
-# 菜单功能
-# =================================================================
+# --- 文件生成函数 (模块化) ---
 
-# 1. 安装服务
-install_monitor() {
-    check_root
-    echo -e "${GREEN}1. 开始安装 Stock Monitor (v6.6)...${NC}"
-
-    if is_installed; then
-        echo -e "${YELLOW}警告：检测到已安装的服务。将首先执行卸载...${NC}"
-        uninstall_monitor
-        # 检查是否真的卸载了
-        if is_installed; then
-            echo -e "${RED}卸载已取消，终止安装。${NC}"
-            exit 0
-        fi
-    fi
-
-    echo -e "${GREEN}更新软件包列表并安装依赖 (python, pip, venv, curl, jq)...${NC}"
-    export DEBIAN_FRONTEND=noninteractive
-    apt update
-    apt install -y python3 python3-pip python3-venv curl jq
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}依赖安装失败，请检查 apt 源或网络连接。${NC}"
-        exit 1
-    fi
-
-    # 询问端口
-    read -p "请输入您希望 Web 服务运行的端口 (1-65535，默认 5000): " MONITOR_PORT
-    MONITOR_PORT=${MONITOR_PORT:-5000}
-
-    # *** 凭据设置 ***
-    echo -e "${GREEN}-------------------------------------------${NC}"
-    echo -e "${YELLOW}为您的 Web UI 设置登录凭据。${NC}"
-    read -p "请输入管理员用户名 (默认: admin): " ADMIN_USER
-    ADMIN_USER=${ADMIN_USER:-admin}
-    read -s -p "请输入管理员密码 (默认: password): " ADMIN_PASS
-    echo "" 
-    ADMIN_PASS=${ADMIN_PASS:-password}
-    echo -e "${GREEN}凭据设置完成。${NC}"
-
-    # *** 自动 FlareSolverr 逻辑 (强制安装) ***
-    echo -e "${GREEN}-------------------------------------------${NC}"
-    echo -e "${GREEN}正在检测并自动配置 FlareSolverr (Docker)...${NC}"
-    
-    PROXY_HOST="" 
-    
-    # 1. 检查并安装 Docker
-    if ! command -v docker &> /dev/null; then
-        echo -e "${YELLOW}未检测到 Docker，正在自动安装...${NC}"
-        curl -fsSL https://get.docker.com | sh
-        if ! command -v docker &> /dev/null; then
-            echo -e "${RED}Docker 安装失败。请手动安装 Docker 后重试。${NC}"
-            exit 1
-        fi
-        echo -e "${GREEN}Docker 安装成功。${NC}"
-    else
-        echo -e "${GREEN}Docker 已安装。${NC}"
-    fi
-    
-    # 2. 安装/重启 FlareSolverr 容器
-    echo -e "${GREEN}正在部署/更新 FlareSolverr 容器...${NC}"
-    
-    docker pull ghcr.io/flaresolverr/flaresolverr:latest
-    docker rm -f flaresolverr &> /dev/null || true
-    
-    docker run -d \
-      --name flaresolverr \
-      -p 8191:8191 \
-      -e LOG_LEVEL=info \
-      --restart always \
-      ghcr.io/flaresolverr/flaresolverr:latest
-      
-    if [ $? -eq 0 ]; then
-        PROXY_HOST="http://127.0.0.1:8191"
-        echo -e "${GREEN}FlareSolverr 部署成功! 代理地址: ${PROXY_HOST}${NC}"
-    else
-        echo -e "${RED}FlareSolverr 容器启动失败。请检查 Docker 日志。${NC}"
-        PROXY_HOST=""
-    fi
-    echo -e "${GREEN}-------------------------------------------${NC}"
-
-    echo -e "${GREEN}创建目录: ${INSTALL_DIR}, ${INSTALL_DIR}/templates, ${DATA_DIR}${NC}"
-    mkdir -p "${INSTALL_DIR}/templates"
-    mkdir -p "${DATA_DIR}"
-
-    # *** 检测旧配置 ***
-    echo -e "${GREEN}-------------------------------------------${NC}"
-    if [ -f "$CONFIG_FILE" ]; then
-        echo -e "${YELLOW}检测到旧配置文件，将保留使用。${NC}"
-    else
-        echo -e "${GREEN}未检测到旧配置，将创建默认配置。${NC}"
-    fi
-    echo -e "${GREEN}-------------------------------------------${NC}"
-
-    echo -e "${GREEN}创建 Python 虚拟环境...${NC}"
-    python3 -m venv "$VENV_DIR"
-    source "${VENV_DIR}/bin/activate"
-    pip install --upgrade pip
-    pip install Flask requests beautifulsoup4
-    deactivate
-
-    # -------------------------------------------------
-    # 写入 core.py (独立调度版)
-    # -------------------------------------------------
-    echo -e "${GREEN}写入 core.py...${NC}"
+generate_core_py() {
+    echo -e "${GREEN}生成核心逻辑 (core.py)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/core.py"
 import json
 import time
@@ -366,11 +265,10 @@ if __name__ == "__main__":
     monitor = StockMonitor()
     monitor.start_monitoring()
 EOF
+}
 
-    # -------------------------------------------------
-    # 写入 web.py
-    # -------------------------------------------------
-    echo -e "${GREEN}写入 web.py...${NC}"
+generate_web_py() {
+    echo -e "${GREEN}生成 Web 服务 (web.py)...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/web.py"
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from core import StockMonitor
@@ -465,11 +363,12 @@ if __name__ == '__main__':
     port = int(os.environ.get("MONITOR_PORT", 5000))
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
 EOF
+}
 
-    # -------------------------------------------------
-    # 写入 templates/index.html
-    # -------------------------------------------------
-    echo -e "${GREEN}写入 Web UI (index.html)...${NC}"
+generate_templates() {
+    echo -e "${GREEN}生成 HTML 模板...${NC}"
+    
+    # index.html
     cat << 'EOF' > "${INSTALL_DIR}/templates/index.html"
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -708,10 +607,7 @@ EOF
 </html>
 EOF
 
-    # -------------------------------------------------
-    # 写入 templates/login.html
-    # -------------------------------------------------
-    echo -e "${GREEN}写入 Web UI (login.html)...${NC}"
+    # login.html
     cat << 'EOF' > "${INSTALL_DIR}/templates/login.html"
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -776,13 +672,10 @@ EOF
 </body>
 </html>
 EOF
+}
 
-
-    # -------------------------------------------------
-    # 写入 systemd 服务文件
-    # -------------------------------------------------
-    echo -e "${GREEN}创建 systemd 服务: ${SERVICE_NAME}.service${NC}"
-    
+generate_service_file() {
+    echo -e "${GREEN}创建 systemd 服务文件...${NC}"
     cat << EOF > "$SERVICE_FILE"
 [Unit]
 Description=Stock Monitor Web Service
@@ -805,25 +698,113 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+}
 
-    echo -e "${GREEN}重载 systemd 并启动服务...${NC}"
+# --- 主安装逻辑 ---
+
+install_monitor() {
+    check_root
+    echo -e "${GREEN}1. 开始安装 Stock Monitor (v6.7)...${NC}"
+
+    # 检查卸载
+    if is_installed; then
+        echo -e "${YELLOW}警告：检测到已安装的服务。将首先执行卸载...${NC}"
+        uninstall_monitor
+        if is_installed; then
+            echo -e "${RED}卸载已取消，终止安装。${NC}"
+            exit 0
+        fi
+    fi
+
+    # 安装依赖
+    echo -e "${GREEN}更新软件包列表并安装依赖...${NC}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt update
+    apt install -y python3 python3-pip python3-venv curl jq
+    [ $? -ne 0 ] && { echo -e "${RED}依赖安装失败。${NC}"; exit 1; }
+
+    # 获取用户输入
+    read -p "请输入您希望 Web 服务运行的端口 (默认 5000): " MONITOR_PORT
+    MONITOR_PORT=${MONITOR_PORT:-5000}
+
+    echo -e "${GREEN}-------------------------------------------${NC}"
+    echo -e "${YELLOW}设置 Web UI 登录凭据${NC}"
+    read -p "管理员用户名 (默认: admin): " ADMIN_USER
+    ADMIN_USER=${ADMIN_USER:-admin}
+    read -s -p "管理员密码 (默认: password): " ADMIN_PASS
+    echo "" 
+    ADMIN_PASS=${ADMIN_PASS:-password}
+    echo -e "${GREEN}-------------------------------------------${NC}"
+
+    # FlareSolverr (强制安装)
+    echo -e "${GREEN}自动配置 FlareSolverr (Docker)...${NC}"
+    PROXY_HOST=""
+    
+    if ! command -v docker &> /dev/null; then
+        echo -e "${YELLOW}安装 Docker...${NC}"
+        curl -fsSL https://get.docker.com | sh
+        [ $? -ne 0 ] && { echo -e "${RED}Docker 安装失败。${NC}"; exit 1; }
+    fi
+    
+    echo -e "${GREEN}部署/更新 FlareSolverr 容器...${NC}"
+    docker pull ghcr.io/flaresolverr/flaresolverr:latest
+    docker rm -f flaresolverr &> /dev/null || true
+    docker run -d --name flaresolverr -p 8191:8191 -e LOG_LEVEL=info --restart always ghcr.io/flaresolverr/flaresolverr:latest
+    
+    if [ $? -eq 0 ]; then
+        PROXY_HOST="http://127.0.0.1:8191"
+        echo -e "${GREEN}FlareSolverr 部署成功!${NC}"
+    else
+        echo -e "${RED}FlareSolverr 启动失败。代理功能可能不可用。${NC}"
+    fi
+
+    # 创建目录结构
+    echo -e "${GREEN}创建目录结构...${NC}"
+    mkdir -p "${INSTALL_DIR}/templates"
+    mkdir -p "${DATA_DIR}"
+
+    # 处理配置文件
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}保留现有配置文件。${NC}"
+    else
+        echo -e "${GREEN}将创建默认配置文件。${NC}"
+    fi
+
+    # Python 环境
+    echo -e "${GREEN}设置 Python 虚拟环境...${NC}"
+    python3 -m venv "$VENV_DIR"
+    source "${VENV_DIR}/bin/activate"
+    pip install --upgrade pip
+    pip install Flask requests beautifulsoup4
+    deactivate
+
+    # 生成应用文件 (调用上方定义的函数)
+    generate_core_py
+    generate_web_py
+    generate_templates
+    generate_service_file
+
+    # 启动服务
+    echo -e "${GREEN}启动 systemd 服务...${NC}"
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
     systemctl start "$SERVICE_NAME"
 
-    echo -e "${GREEN}安装 'sm' 快捷命令到 ${SM_COMMAND_PATH}...${NC}"
+    # 安装快捷命令
+    echo -e "${GREEN}安装 'sm' 快捷命令...${NC}"
     cp "$0" "$SM_COMMAND_PATH"
     chmod +x "$SM_COMMAND_PATH"
 
     echo -e "${GREEN}================ 安装完成 ==================${NC}"
-    echo -e "Web 界面正在运行于: ${YELLOW}http://<您的IP>:${MONITOR_PORT}${NC}"
-    echo -e "您的登录用户名: ${YELLOW}${ADMIN_USER}${NC}"
-    echo -e "您的登录密码:   ${YELLOW}${ADMIN_PASS}${NC}"
-    echo -e "配置文件路径: ${YELLOW}${CONFIG_FILE}${NC}"
-    echo -e "您现在可以在任何位置使用 ${GREEN}sm${NC} 命令管理服务。"
+    echo -e "Web 界面:     ${YELLOW}http://<您的IP>:${MONITOR_PORT}${NC}"
+    echo -e "登录用户名:   ${YELLOW}${ADMIN_USER}${NC}"
+    echo -e "登录密码:     ${YELLOW}${ADMIN_PASS}${NC}"
+    echo -e "配置文件:     ${YELLOW}${CONFIG_FILE}${NC}"
+    echo -e "管理命令:     ${GREEN}sm${NC}"
 }
 
-# 2. 卸载服务
+# --- 卸载功能 ---
+
 uninstall_monitor() {
     check_root
     echo -e "${RED}警告：您即将卸载 Stock Monitor 服务。${NC}"
@@ -833,7 +814,7 @@ uninstall_monitor() {
         return
     fi
 
-    echo -e "${RED}开始卸载 Stock Monitor...${NC}"
+    echo -e "${RED}开始卸载...${NC}"
 
     if [ -f "$SERVICE_FILE" ]; then
         systemctl stop "$SERVICE_NAME"
@@ -842,8 +823,7 @@ uninstall_monitor() {
         systemctl daemon-reload
     fi
 
-    echo -e "${YELLOW}-------------------------------------------${NC}"
-    read -p "您是否希望保留用户配置文件 (${DATA_DIR})？ (y/N): " keep_config
+    read -p "是否保留配置文件 (${DATA_DIR})？ (y/N): " keep_config
     if [[ "$keep_config" =~ ^[Yy]$ ]]; then
         rm -rf "${INSTALL_DIR}/venv"
         rm -f "${INSTALL_DIR}/core.py"
@@ -851,19 +831,20 @@ uninstall_monitor() {
         rm -rf "${INSTALL_DIR}/templates"
         echo -e "${YELLOW}数据已保留。${NC}"
     else
-        if [ -d "$INSTALL_DIR" ]; then rm -rf "$INSTALL_DIR"; fi
+        [ -d "$INSTALL_DIR" ] && rm -rf "$INSTALL_DIR"
     fi
 
-    if [ -f "$SM_COMMAND_PATH" ]; then rm "$SM_COMMAND_PATH"; fi
-
-    # 删除覆盖配置
+    [ -f "$SM_COMMAND_PATH" ] && rm "$SM_COMMAND_PATH"
+    
+    # 清理 override 配置
     local DROP_IN_DIR="/etc/systemd/system/${SERVICE_NAME}.service.d"
     if [ -d "$DROP_IN_DIR" ]; then rm -rf "$DROP_IN_DIR"; systemctl daemon-reload; fi
 
     echo -e "${GREEN}卸载完成。${NC}"
 }
 
-# 3. 状态与日志
+# --- 管理功能 ---
+
 check_status() {
     echo -e "${GREEN}--- 服务状态 ---${NC}"
     systemctl status "$SERVICE_NAME" --no-pager
@@ -881,12 +862,10 @@ show_logs() {
     -e "s/Error/${c_red}Error${c_reset}/g"
 }
 
-# 4. 服务控制
 start_service() { systemctl start "$SERVICE_NAME"; check_status; }
 stop_service() { systemctl stop "$SERVICE_NAME"; check_status; }
 restart_service() { systemctl restart "$SERVICE_NAME"; check_status; }
 
-# 5. 自动重启设置
 setup_auto_restart() {
     check_root
     local OVERRIDE_FILE="/etc/systemd/system/${SERVICE_NAME}.service.d/auto-restart.conf"
@@ -911,13 +890,11 @@ EOF
     systemctl restart "$SERVICE_NAME"
 }
 
-# =================================================================
-# 菜单逻辑
-# =================================================================
+# --- 菜单界面 ---
 
 show_menu() {
     clear
-    # 获取服务状态并带上颜色
+    # 状态栏逻辑
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         STATUS_MSG="${GREEN}● 运行中 (Active)${NC}"
     else
@@ -925,7 +902,7 @@ show_menu() {
     fi
 
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 管理菜单 (v6.6)${NC}"
+    echo -e "${GREEN}   Stock Monitor 管理菜单 (v6.7)${NC}"
     echo -e "${GREEN}===========================================${NC}"
     echo -e " 服务状态: ${STATUS_MSG}"
     echo -e "${GREEN}-------------------------------------------${NC}"
@@ -956,6 +933,8 @@ show_menu() {
     read -p "按任意键返回菜单..."
     show_menu
 }
+
+# --- 主入口 ---
 
 if [ "$1" == "install" ]; then check_root; install_monitor; exit 0; fi
 if [ "$1" == "uninstall" ]; then check_root; uninstall_monitor; exit 0; fi
