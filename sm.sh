@@ -3,7 +3,7 @@
 # =================================================================
 # Stock Monitor (Pushplus 版) 多功能管理脚本
 # 快捷命令: sm
-# (v6.8 - 增加检测过程详细日志)
+# (v6.11 - 紧急修复: 解决 response 元组嵌套导致的 AttributeError)
 # =================================================================
 
 # --- 颜色定义 ---
@@ -44,11 +44,13 @@ is_installed() {
 # --- 文件生成函数 (模块化) ---
 
 generate_core_py() {
-    echo -e "${GREEN}生成核心逻辑 (core.py) - 已增强日志...${NC}"
+    echo -e "${GREEN}生成核心逻辑 (core.py) - [v6.11 修复元组错误]...${NC}"
     cat << 'EOF' > "${INSTALL_DIR}/core.py"
 import json
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from datetime import datetime
 import os
@@ -69,6 +71,14 @@ class StockMonitor:
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
         }
         
+        # 配置重试机制的 Session
+        self.session = requests.Session()
+        retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 504])
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        self.session.headers.update(self.headers)
+
         self.next_run_times = {} 
         self.running_tasks = set() 
         self.executor = None
@@ -126,59 +136,89 @@ class StockMonitor:
             with open(self.config_path, 'w') as f:
                 json.dump(self.config, f, indent=4)
 
+    # 修复：只返回对象，不返回元组
     def _mock_failed_response(self, status_code, content):
         class MockResponse:
             def __init__(self, s, c): self.status_code, self.content = s, c
-        return MockResponse(status_code, content), ""
+        return MockResponse(status_code, content)
 
     def check_stock(self, url, alert_class="alert alert-danger error-heading"):
+        # 内部函数：使用 FlareSolverr 代理
         def fetch_flaresolverr(url):
             headers = {"Content-Type": "application/json"}
             data = {"cmd": "request.get", "url": url, "maxTimeout": 120000}
             try:
                 print(f"    -> 尝试使用 FlareSolverr 代理...", flush=True)
-                response = requests.post(f'{self.proxy_host}/v1', headers=headers, json=data)
+                # 代理请求时间放宽到 130s
+                response = requests.post(f'{self.proxy_host}/v1', headers=headers, json=data, timeout=130)
                 resp_json = response.json()
                 if resp_json.get('status') == 'ok' and 'solution' in resp_json:
-                    return response, resp_json['solution']['response']
-                return self._mock_failed_response(500, "FlareSolverr failed")
+                    # 修复：显式构建 (Response, Content) 元组
+                    mock_resp = self._mock_failed_response(200, resp_json['solution']['response'].encode('utf-8'))
+                    return mock_resp, resp_json['solution']['response']
+                
+                return self._mock_failed_response(500, "FlareSolverr failed"), ""
             except Exception as e:
-                return self._mock_failed_response(503, str(e))
+                return self._mock_failed_response(503, str(e)), ""
 
         try:
             print(f"    -> 正在请求: {url}", flush=True)
             content = None
             use_proxy = False
+            
+            # 1. 检查是否被列入强制代理名单
             if self.proxy_host:
                 with self.lock:
                     if url in self.blocked_urls: use_proxy = True
             
             response = None
-            
-            if not self.proxy_host:
-                response = requests.get(url, headers=self.headers, timeout=30)
-                if response.status_code == 403: 
-                    print(f"    -> 直接请求返回 403 禁止访问", flush=True)
-                    return None
-                content = response.content
-            elif use_proxy:
+            TIMEOUT_SETTING = 60 
+
+            # 2. 尝试获取响应
+            if use_proxy and self.proxy_host:
+                # 强制使用代理路径
                 response, content = fetch_flaresolverr(url)
-                if random.random() < 0.05:
+                # 如果代理成功，极小概率尝试移除名单（探测直连是否恢复）
+                if response.status_code == 200 and random.random() < 0.01:
                     with self.lock:
                         if url in self.blocked_urls: self.blocked_urls.remove(url)
             else:
-                response = requests.get(url, headers=self.headers, timeout=30)
-                if response.status_code == 403:
-                    print(f"    -> 直接请求 403，切换 FlareSolverr...", flush=True)
+                # 默认路径：直连优先 -> 失败转代理
+                try:
+                    response = self.session.get(url, timeout=TIMEOUT_SETTING)
+                    content = response.content
+                except Exception as e:
+                    print(f"    -> 直连请求异常: {e}", flush=True)
+                    response = None # 确保标记为 None 以触发下方逻辑
+
+                # --- 强制故障转移判断 ---
+                should_switch_proxy = False
+                
+                if response is None:
+                    print(f"    -> 直连无响应 (None)，切换代理...", flush=True)
+                    should_switch_proxy = True
+                elif response.status_code in [403, 429, 503]:
+                    print(f"    -> 直连状态码 {response.status_code}，切换代理...", flush=True)
+                    should_switch_proxy = True
+                
+                if should_switch_proxy and self.proxy_host:
                     response, content = fetch_flaresolverr(url)
                     if response.status_code == 200:
+                        # 只有代理成功时才加入黑名单，避免无效加入
                         with self.lock: self.blocked_urls.add(url)
-                content = response.content
-            
+                elif should_switch_proxy and not self.proxy_host:
+                    print(f"    -> 需要代理但未配置 FlareSolverr", flush=True)
+
+            # 3. 最终结果判断
             if not response:
-                print(f"    -> 请求无响应", flush=True)
+                print(f"    -> 请求彻底失败 (无响应)", flush=True)
                 return None
                 
+            # 如果是 FlareSolverr 返回的 mock 对象，content 已经在 fetch_flaresolverr 里处理了
+            # 如果是 requests 返回的对象，且 content 为空，重新赋值
+            if content is None and hasattr(response, 'content'):
+                content = response.content
+
             print(f"    -> 响应状态: {response.status_code}, 内容大小: {len(content) if content else 0} bytes", flush=True)
             
             if response.status_code != 200: return None
@@ -206,21 +246,22 @@ class StockMonitor:
             print(f"    -> 未发现缺货标识，判定为 [有货]", flush=True)
             return True
         except Exception as e:
-            print(f"    -> 请求/解析异常: {e}", flush=True)
+            print(f"    -> 核心逻辑异常: {e}", flush=True)
             return None
 
     def send_message(self, message):
         cfg = self.config['config']
         nt = cfg.get('notice_type', 'pushplus')
         try:
+            # 发送通知时也使用 session 以提高稳定性
             if nt == 'pushplus' and cfg.get('pushplus_token'):
-                requests.get("http://www.pushplus.plus/send", params={"token": cfg['pushplus_token'], "title": "库存通知", "content": message})
+                self.session.get("http://www.pushplus.plus/send", params={"token": cfg['pushplus_token'], "title": "库存通知", "content": message}, timeout=10)
             elif nt == 'telegram' and cfg.get('telegrambot') and cfg.get('chat_id'):
-                requests.get(f"https://api.telegram.org/bot{cfg['telegrambot']}/sendMessage", params={"chat_id": cfg['chat_id'], "text": message})
+                self.session.get(f"https://api.telegram.org/bot{cfg['telegrambot']}/sendMessage", params={"chat_id": cfg['chat_id'], "text": message}, timeout=10)
             elif nt == 'wechat' and cfg.get('wechat_key'):
-                requests.get(f"https://xizhi.qqoq.net/{cfg['wechat_key']}.send", params={'title': '库存通知', 'content': message})
+                self.session.get(f"https://xizhi.qqoq.net/{cfg['wechat_key']}.send", params={'title': '库存通知', 'content': message}, timeout=10)
             elif nt == 'custom' and cfg.get('custom_url'):
-                requests.get(cfg['custom_url'].replace("{message}", message))
+                self.session.get(cfg['custom_url'].replace("{message}", message), timeout=10)
             print(f"通知已发送: {message.splitlines()[0]}", flush=True)
         except Exception as e:
             print(f"发送通知失败: {e}", flush=True)
@@ -727,7 +768,7 @@ EOF
 
 install_monitor() {
     check_root
-    echo -e "${GREEN}1. 开始安装 Stock Monitor (v6.8)...${NC}"
+    echo -e "${GREEN}1. 开始安装 Stock Monitor (v6.11)...${NC}"
 
     # 检查卸载
     if is_installed; then
@@ -925,7 +966,7 @@ show_menu() {
     fi
 
     echo -e "${GREEN}===========================================${NC}"
-    echo -e "${GREEN}   Stock Monitor 管理菜单 (v6.8)${NC}"
+    echo -e "${GREEN}   Stock Monitor 管理菜单 (v6.11)${NC}"
     echo -e "${GREEN}===========================================${NC}"
     echo -e " 服务状态: ${STATUS_MSG}"
     echo -e "${GREEN}-------------------------------------------${NC}"
